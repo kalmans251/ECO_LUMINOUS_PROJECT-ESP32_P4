@@ -29,15 +29,18 @@
 
 #define UART_BUF_SIZE        1024
 
+// 전원 및 릴레이
 #define RELAY_PIN            GPIO_NUM_2
 #define PROJECTOR_PIN        GPIO_NUM_11
 
+// 네오픽셀
 #define DATA_PIN_1           GPIO_NUM_4
 #define DATA_PIN_2           GPIO_NUM_5
 #define NUM_ROWS             4
 #define LEDS_PER_ROW         31
 #define NUM_LEDS             (LEDS_PER_ROW * NUM_ROWS)
 
+// I2C INA219
 #define I2C_SDA_PIN          GPIO_NUM_8
 #define I2C_SCL_PIN          GPIO_NUM_9
 #define I2C_FREQ_HZ          400000
@@ -94,11 +97,23 @@ static uint32_t          s_anim_frame        = 0;
 
 static volatile int64_t  s_sleep_wake_timer  = 0;
 #define HOLD_TIME_MS     10000
-
 static volatile bool     s_system_power_state = true;
 static bool              s_last_power_state   = true;
 
+// 빗방울 매트릭스 변수
+#define NUM_COLUMNS 8
+static const uint8_t RAIN_COLUMNS[NUM_COLUMNS] = {2, 6, 10, 14, 18, 22, 26, 29};
+typedef enum { STATE_WAITING, STATE_FALLING } drop_state_t;
+static drop_state_t s_column_state[NUM_COLUMNS];
+static int64_t s_column_next_drop[NUM_COLUMNS] = {0};
+
+// 음향 반응 필터
 static uint8_t s_audio_bands[8] = {0};
+static float s_smooth_bass = 0.0f;
+static float s_smooth_acoustic = 0.0f;
+static float s_peak_bass_max = 2.0f;
+static float s_peak_acoustic_max = 2.0f;
+
 static bool s_is_left_ina_ready = false;
 static bool s_is_right_ina_ready = false;
 
@@ -115,23 +130,56 @@ static uint8_t sine8(uint8_t theta) {
     return (uint8_t)(val > 255.0f ? 255 : (val < 0.0f ? 0 : val));
 }
 
-static void set_pixel1(uint8_t row, uint8_t col, uint8_t r, uint8_t g, uint8_t b) {
-    if (row >= NUM_ROWS || col >= LEDS_PER_ROW) return;
+static void hsv2rgb(uint16_t hue, uint8_t sat, uint8_t val, uint8_t *r, uint8_t *g, uint8_t *b) {
+    uint8_t region = hue / 43;
+    uint8_t remainder = (hue - (region * 43)) * 6;
+    uint8_t p = (val * (255 - sat)) >> 8;
+    uint8_t q = (val * (255 - ((sat * remainder) >> 8))) >> 8;
+    uint8_t t = (val * (255 - ((sat * (255 - remainder)) >> 8))) >> 8;
+
+    switch (region) {
+        case 0:  *r = val; *g = t;   *b = p;   break;
+        case 1:  *r = q;   *g = val; *b = p;   break;
+        case 2:  *r = p;   *g = val; *b = t;   break;
+        case 3:  *r = p;   *g = q;   *b = val; break;
+        case 4:  *r = t;   *g = p;   *b = val; break;
+        default: *r = val; *g = p;   *b = q;   break;
+    }
+}
+
+static uint16_t get_pixel_index(uint8_t row, uint8_t col) {
+    if (row >= NUM_ROWS || col >= LEDS_PER_ROW) return 0;
     if (row % 2 == 1) col = (LEDS_PER_ROW - 1) - col;
-    uint16_t idx = (row * LEDS_PER_ROW) + col;
+    return (row * LEDS_PER_ROW) + col;
+}
+
+static void set_pixel1(uint8_t row, uint8_t col, uint8_t r, uint8_t g, uint8_t b) {
+    uint16_t idx = get_pixel_index(row, col);
     if (idx < NUM_LEDS) { s_fb1[idx][0] = r; s_fb1[idx][1] = g; s_fb1[idx][2] = b; }
 }
 
 static void set_pixel2(uint8_t row, uint8_t col, uint8_t r, uint8_t g, uint8_t b) {
-    if (row >= NUM_ROWS || col >= LEDS_PER_ROW) return;
-    if (row % 2 == 1) col = (LEDS_PER_ROW - 1) - col;
-    uint16_t idx = (row * LEDS_PER_ROW) + col;
+    uint16_t idx = get_pixel_index(row, col);
     if (idx < NUM_LEDS) { s_fb2[idx][0] = r; s_fb2[idx][1] = g; s_fb2[idx][2] = b; }
+}
+
+static void set_pixel_2d_cyan(uint8_t row, uint8_t col) {
+    set_pixel1(row, col, 255, 0, 255);
+    set_pixel2(row, col, 0, 255, 255);
 }
 
 static void clear_all_leds(void) {
     memset(s_fb1, 0, sizeof(s_fb1));
     memset(s_fb2, 0, sizeof(s_fb2));
+}
+
+static bool is_column_active(uint8_t col) {
+    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+        uint16_t idx = get_pixel_index(r, col);
+        if ((s_fb1[idx][0] | s_fb1[idx][1] | s_fb1[idx][2]) > 0 ||
+            (s_fb2[idx][0] | s_fb2[idx][1] | s_fb2[idx][2]) > 0) return true;
+    }
+    return false;
 }
 
 static void flush_led_strips(void) {
@@ -146,7 +194,9 @@ static void flush_led_strips(void) {
 static void update_led_sequence(void) {
     int64_t current_millis = millis();
     static int64_t last_led_update = 0;
+    bool need_show = false;
 
+    // 0. 비상 통화 모드 (적색 긴급 브리딩 점등)
     if (s_voice_call_mode) {
         if (current_millis - last_led_update > 30) {
             last_led_update = current_millis;
@@ -162,18 +212,323 @@ static void update_led_sequence(void) {
         return;
     }
 
-    if (current_millis - last_led_update > 20) {
-        last_led_update = current_millis;
-        for (uint8_t r = 0; r < NUM_ROWS; r++) {
-            for (uint8_t c = 0; c < LEDS_PER_ROW; c++) {
-                uint8_t bright = sine8((c * 12) + (r * 40) + (s_anim_frame * 4));
-                set_pixel1(r, c, bright / 4, 0, bright);
-                set_pixel2(r, c, 0, bright / 4, bright);
-            }
+    // 1. 카테고리 0: 일반 조명 모드 (1~7)
+    if (s_current_category == 0) {
+        switch (s_current_sub_mode) {
+            case 1: // 레인보우 웨이브
+                if (current_millis - last_led_update > 10) {
+                    last_led_update = current_millis;
+                    uint8_t base_hue = (uint8_t)(s_anim_frame * 2);
+                    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+                        for (uint8_t c = 0; c < LEDS_PER_ROW; c++) {
+                            uint8_t h = base_hue + (c * 8) + (r * 32);
+                            uint8_t cr, cg, cb;
+                            hsv2rgb(h, 240, 200, &cr, &cg, &cb);
+                            set_pixel1(r, c, cr, cg, cb); set_pixel2(r, c, cr, cg, cb);
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            case 2: // 2D Cyan 스윕
+                if (current_millis - last_led_update > 80) {
+                    last_led_update = current_millis;
+                    clear_all_leds();
+                    uint8_t active_row = (s_anim_frame / 2) % (NUM_ROWS * 2 - 2);
+                    if (active_row >= NUM_ROWS) active_row = (NUM_ROWS * 2 - 2) - active_row;
+                    for (uint8_t c = 0; c < LEDS_PER_ROW; c++) set_pixel_2d_cyan(active_row, c);
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            case 3: // 보라/시안 웨이브
+                if (current_millis - last_led_update > 20) {
+                    last_led_update = current_millis;
+                    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+                        for (uint8_t c = 0; c < LEDS_PER_ROW; c++) {
+                            uint8_t bright = sine8((c * 12) + (r * 40) + (s_anim_frame * 4));
+                            set_pixel1(r, c, bright / 4, 0, bright);
+                            set_pixel2(r, c, 0, bright / 4, bright);
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            case 4: // 네온 스네이크
+                if (current_millis - last_led_update > 10) {
+                    last_led_update = current_millis;
+                    clear_all_leds();
+                    uint16_t head = s_anim_frame % NUM_LEDS;
+                    for (uint8_t i = 0; i < 20; i++) {
+                        int pixel_idx = (head - i + NUM_LEDS) % NUM_LEDS;
+                        uint8_t bright = (20 - i) * 255 / 20;
+                        s_fb1[pixel_idx][0] = bright / 2; s_fb1[pixel_idx][1] = bright; s_fb1[pixel_idx][2] = 0;
+                        s_fb2[pixel_idx][0] = bright;     s_fb2[pixel_idx][1] = bright / 2; s_fb2[pixel_idx][2] = 0;
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            case 5: // 듀얼 센터 확장
+                if (current_millis - last_led_update > 30) {
+                    last_led_update = current_millis;
+                    clear_all_leds();
+                    uint8_t step = s_anim_frame % 16;
+                    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+                        uint8_t g_val = (step * 10 < 150) ? (150 - step * 10) : 0;
+                        if (15 - step >= 0) {
+                            set_pixel1(r, 15 - step, g_val, 255, 0); set_pixel2(r, 15 - step, 255, g_val, 0);
+                        }
+                        if (15 + step < LEDS_PER_ROW) {
+                            set_pixel1(r, 15 + step, g_val, 255, 0); set_pixel2(r, 15 + step, 255, g_val, 0);
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            case 6: // 빗방울 매트릭스
+                if (current_millis - last_led_update > 60) {
+                    last_led_update = current_millis;
+                    for (int i = 0; i < NUM_LEDS; i++) {
+                        s_fb1[i][0] = s_fb1[i][0] * 70 / 100; s_fb1[i][1] = s_fb1[i][1] * 70 / 100; s_fb1[i][2] = s_fb1[i][2] * 70 / 100;
+                        s_fb2[i][0] = s_fb2[i][0] * 70 / 100; s_fb2[i][1] = s_fb2[i][1] * 70 / 100; s_fb2[i][2] = s_fb2[i][2] * 70 / 100;
+                    }
+                    for (int r = 0; r < NUM_ROWS - 1; r++) {
+                        for (int c = 0; c < LEDS_PER_ROW; c++) {
+                            uint16_t up = get_pixel_index(r + 1, c);
+                            if ((s_fb1[up][0] | s_fb1[up][1] | s_fb1[up][2]) > 0) set_pixel1(r, c, s_fb1[up][0], s_fb1[up][1], s_fb1[up][2]);
+                            if ((s_fb2[up][0] | s_fb2[up][1] | s_fb2[up][2]) > 0) set_pixel2(r, c, s_fb2[up][0], s_fb2[up][1], s_fb2[up][2]);
+                        }
+                    }
+                    for (uint8_t i = 0; i < NUM_COLUMNS; i++) {
+                        uint8_t col = RAIN_COLUMNS[i];
+                        if (s_column_state[i] == STATE_FALLING && !is_column_active(col)) {
+                            s_column_state[i] = STATE_WAITING;
+                            s_column_next_drop[i] = current_millis + (rand() % 2500 + 1000);
+                        }
+                        if (s_column_state[i] == STATE_WAITING && current_millis >= s_column_next_drop[i]) {
+                            set_pixel_2d_cyan(NUM_ROWS - 1, col);
+                            s_column_state[i] = STATE_FALLING;
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            case 7: // 교차 스트로브
+                if (current_millis - last_led_update > 250) {
+                    last_led_update = current_millis;
+                    clear_all_leds();
+                    bool phase = (s_anim_frame % 2 == 0);
+                    for (uint8_t c = 0; c < LEDS_PER_ROW; c++) {
+                        set_pixel1(0, c, phase ? 0 : 200, phase ? 180 : 0, phase ? 255 : 0);
+                        set_pixel2(0, c, phase ? 180 : 255, phase ? 0 : 200, phase ? 255 : 0);
+                        set_pixel1(1, c, phase ? 200 : 0, phase ? 255 : 180, phase ? 0 : 255);
+                        set_pixel2(1, c, phase ? 255 : 180, phase ? 200 : 0, phase ? 0 : 255);
+                        set_pixel1(2, c, phase ? 0 : 200, phase ? 180 : 0, phase ? 255 : 0);
+                        set_pixel2(2, c, phase ? 180 : 255, phase ? 0 : 200, phase ? 255 : 0);
+                        set_pixel1(3, c, phase ? 200 : 0, phase ? 255 : 180, phase ? 0 : 255);
+                        set_pixel2(3, c, phase ? 255 : 180, phase ? 200 : 0, phase ? 0 : 255);
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            default:
+                clear_all_leds(); need_show = true; break;
         }
-        s_anim_frame++;
-        flush_led_strips();
     }
+    // 2. 카테고리 1: 센서 반응 모드 (1~2)
+    else if (s_current_category == 1) {
+        switch (s_current_sub_mode) {
+            case 1: // 앰버 골드 사인
+                if (current_millis - last_led_update > 30) {
+                    last_led_update = current_millis;
+                    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+                        for (uint8_t c = 0; c < LEDS_PER_ROW; c++) {
+                            uint8_t bright = sine8((c * 10) + (s_anim_frame * 2));
+                            set_pixel1(r, c, bright, (uint8_t)(bright * 7 / 10), 0);
+                            set_pixel2(r, c, bright, (uint8_t)(bright * 7 / 10), 0);
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            case 2: // 스파클
+                if (current_millis - last_led_update > 40) {
+                    last_led_update = current_millis;
+                    clear_all_leds();
+                    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+                        for (uint8_t c = 0; c < LEDS_PER_ROW; c++) {
+                            if ((c + r) % 5 == (s_anim_frame % 5)) {
+                                set_pixel1(r, c, 0, 180, 255); set_pixel2(r, c, 0, 255, 200);
+                            }
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            default:
+                if (current_millis - last_led_update > 50) {
+                    last_led_update = current_millis;
+                    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+                        for (uint8_t c = 0; c < LEDS_PER_ROW; c++) {
+                            uint8_t bright = sine8((c * 8) + (r * 20) + s_anim_frame);
+                            set_pixel1(r, c, bright / 2, bright / 2, bright / 2);
+                            set_pixel2(r, c, bright / 2, bright / 2, bright / 2);
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+        }
+    }
+    // 3. 카테고리 2/3: 뮤직/스펙트럼 반응 모드 (0~2)
+    else if (s_current_category == 2 || s_current_category == 3) {
+        switch (s_music_led_pattern) {
+            case 0: // 어쿠스틱 리플
+                if (current_millis - last_led_update > 15) {
+                    last_led_update = current_millis;
+                    clear_all_leds();
+                    float overall_audio = (s_audio_bands[0] * 0.45f) + (s_audio_bands[1] * 0.25f) + (s_audio_bands[2] * 0.18f) + (s_audio_bands[3] * 0.12f);
+                    if (overall_audio == 0.0f) {
+                        uint8_t d_sin = sine8(s_anim_frame * 3);
+                        overall_audio = (d_sin > 110) ? ((float)(d_sin - 110) * 3.0f / 145.0f + 1.0f) : 0.0f;
+                    }
+                    if (overall_audio > s_peak_acoustic_max) s_peak_acoustic_max = overall_audio;
+                    else s_peak_acoustic_max = (s_peak_acoustic_max * 0.995f) + (overall_audio * 0.005f);
+                    if (s_peak_acoustic_max < 2.0f) s_peak_acoustic_max = 2.0f;
+
+                    float norm_audio = overall_audio / s_peak_acoustic_max;
+                    if (norm_audio > 1.0f) norm_audio = 1.0f;
+                    if (norm_audio > s_smooth_acoustic) s_smooth_acoustic = norm_audio;
+                    else s_smooth_acoustic *= 0.94f;
+
+                    float active_radius = 12.0f + (s_smooth_acoustic * 3.0f);
+                    float max_h = s_smooth_acoustic * (NUM_ROWS - 0.01f);
+
+                    for (uint8_t c = 0; c < LEDS_PER_ROW; c++) {
+                        float dist = fabsf((float)c - 15.0f);
+                        if (dist <= active_radius) {
+                            float norm_dist = dist / active_radius;
+                            float profile = 1.0f - (0.85f * norm_dist * norm_dist);
+                            float ripple = ((float)sine8(c * 15 + s_anim_frame * 4) - 128.0f) / 255.0f * 0.45f * (s_smooth_acoustic + 0.3f);
+                            float raw_h = (max_h * profile) + ripple;
+                            if (raw_h < 0.2f) raw_h = 0.2f;
+                            uint8_t full_rows = (uint8_t)raw_h;
+                            float row_frac = raw_h - full_rows;
+
+                            for (uint8_t r = 0; r <= full_rows && r < NUM_ROWS; r++) {
+                                float alpha = (r == full_rows) ? row_frac : 1.0f;
+                                if (alpha <= 0.05f && r == full_rows) continue;
+                                float base_a = (r == 0) ? (0.75f + 0.25f * (sine8(c * 12 + s_anim_frame * 3) / 255.0f)) * alpha : alpha;
+                                uint8_t hue = (c * 5 + r * 15 + s_anim_frame * 2) % 256;
+                                uint8_t cr, cg, cb;
+                                hsv2rgb(hue, 230, (uint8_t)(255 * base_a), &cr, &cg, &cb);
+                                set_pixel1(r, c, cr, cg, cb); set_pixel2(r, c, cr, cg, cb);
+                            }
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            case 1: // 베이스 임팩트 스트림
+                if (current_millis - last_led_update > 12) {
+                    last_led_update = current_millis;
+                    clear_all_leds();
+                    float bass_val = (float)s_audio_bands[0];
+                    float mid_val  = (float)s_audio_bands[1];
+                    float raw_bass = (bass_val * 0.85f) + (mid_val * 0.15f);
+                    if (raw_bass == 0.0f) {
+                        uint8_t d_sin = sine8(s_anim_frame * 2);
+                        raw_bass = (d_sin > 130) ? ((float)(d_sin - 130) * 4.0f / 125.0f) : 0.0f;
+                    }
+                    if (raw_bass > s_peak_bass_max) s_peak_bass_max = raw_bass;
+                    else s_peak_bass_max = (s_peak_bass_max * 0.995f) + (raw_bass * 0.005f);
+                    if (s_peak_bass_max < 2.0f) s_peak_bass_max = 2.0f;
+
+                    float norm_bass = raw_bass / s_peak_bass_max;
+                    if (norm_bass > 1.0f) norm_bass = 1.0f;
+                    if (norm_bass > s_smooth_bass) s_smooth_bass = norm_bass;
+                    else s_smooth_bass *= 0.955f;
+
+                    float impact = s_smooth_bass * s_smooth_bass;
+                    bool is_kick = (bass_val >= 3.0f);
+
+                    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+                        float min_len = (r == 1 || r == 2) ? 4.0f : 0.8f;
+                        float max_len = (r == 1 || r == 2) ? 31.0f : 18.0f;
+                        float cur_len = min_len + impact * (max_len - min_len);
+                        uint8_t full_pix = (uint8_t)cur_len;
+                        float frac = cur_len - full_pix;
+
+                        for (uint8_t c = 0; c <= full_pix && c < LEDS_PER_ROW; c++) {
+                            float alpha = (c == full_pix) ? frac : 1.0f;
+                            uint8_t stream_wave = sine8((c * 18) - (s_anim_frame * 2));
+                            uint8_t bright = (uint8_t)(((stream_wave * 115 / 255) + 140) * alpha);
+                            uint8_t hue = (130 + (c * 2) + s_anim_frame) % 256;
+                            uint8_t cr, cg, cb;
+                            if (is_kick && c <= 2) { cr = 230; cg = 255; cb = 255; }
+                            else { hsv2rgb(hue, 220, bright, &cr, &cg, &cb); }
+                            set_pixel1(r, c, cr, cg, cb); set_pixel2(r, c, cr, cg, cb);
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+            default: // 센터 방사형 이퀄라이저
+                if (current_millis - last_led_update > 12) {
+                    last_led_update = current_millis;
+                    clear_all_leds();
+                    float bass_val = (float)s_audio_bands[0];
+                    float mid_val  = (float)s_audio_bands[1];
+                    float raw_lvl  = (bass_val * 0.85f) + (mid_val * 0.15f);
+                    if (raw_lvl == 0.0f) {
+                        uint8_t d_sin = sine8(s_anim_frame * 2);
+                        raw_lvl = (d_sin > 140) ? ((float)(d_sin - 140) * 3.5f / 115.0f) : 0.0f;
+                    }
+                    if (raw_lvl > s_peak_acoustic_max) s_peak_acoustic_max = raw_lvl;
+                    else s_peak_acoustic_max = (s_peak_acoustic_max * 0.995f) + (raw_lvl * 0.005f);
+                    if (s_peak_acoustic_max < 2.0f) s_peak_acoustic_max = 2.0f;
+
+                    float norm_lvl = raw_lvl / s_peak_acoustic_max;
+                    if (norm_lvl > 1.0f) norm_lvl = 1.0f;
+                    if (norm_lvl > s_smooth_acoustic) s_smooth_acoustic = norm_lvl;
+                    else s_smooth_acoustic *= 0.955f;
+
+                    float impact = s_smooth_acoustic * s_smooth_acoustic;
+                    bool is_kick = (bass_val >= 3.0f);
+                    float center_col = 15.0f;
+
+                    for (uint8_t r = 0; r < NUM_ROWS; r++) {
+                        float min_rad = (r == 1 || r == 2) ? 4.5f : 0.8f;
+                        float max_rad = (r == 1 || r == 2) ? 15.0f : 8.5f;
+                        float cur_rad = min_rad + impact * (max_rad - min_rad);
+                        uint8_t full_rad = (uint8_t)cur_rad;
+                        float frac = cur_rad - full_rad;
+
+                        for (uint8_t dist = 0; dist <= full_rad && dist <= 15; dist++) {
+                            int left_c = (int)(center_col - dist);
+                            int right_c = (int)(center_col + dist);
+                            float alpha = (dist == full_rad) ? frac : 1.0f;
+                            uint8_t wave_dim = sine8((dist * 22) - (s_anim_frame * 2));
+                            uint8_t bright = (uint8_t)(((wave_dim * 125 / 255) + 130) * alpha);
+                            uint8_t hue = (s_anim_frame + dist * 6) % 256;
+                            uint8_t cr, cg, cb;
+                            if (is_kick && dist <= 3) { cr = 255; cg = 255; cb = 230; }
+                            else { hsv2rgb(hue, is_kick ? 180 : 230, bright, &cr, &cg, &cb); }
+
+                            if (left_c >= 0 && left_c < LEDS_PER_ROW) {
+                                set_pixel1(r, left_c, cr, cg, cb); set_pixel2(r, left_c, cr, cg, cb);
+                            }
+                            if (right_c >= 0 && right_c < LEDS_PER_ROW) {
+                                set_pixel1(r, right_c, cr, cg, cb); set_pixel2(r, right_c, cr, cg, cb);
+                            }
+                        }
+                    }
+                    s_anim_frame++; need_show = true;
+                }
+                break;
+        }
+    }
+
+    if (need_show) flush_led_strips();
 }
 
 static esp_err_t ina219_read_reg(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint16_t *val) {
@@ -223,6 +578,15 @@ static void read_battery_and_calculate_pct(void) {
     s_latest_bat_pct = (uint8_t)mapped;
 }
 
+static void update_power_relay_only(void) {
+    if (s_power_supply_mode == 2) gpio_set_level(RELAY_PIN, 1);
+    else if (s_power_supply_mode == 1) gpio_set_level(RELAY_PIN, 0);
+    else {
+        if (s_latest_bat_pct <= 20) gpio_set_level(RELAY_PIN, 1);
+        else if (s_latest_bat_pct >= 90) gpio_set_level(RELAY_PIN, 0);
+    }
+}
+
 static void send_to_wroom(const char *cmd) {
     if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
         uart_write_bytes(WROOM_CTRL_UART_NUM, cmd, strlen(cmd));
@@ -265,6 +629,7 @@ static void handle_wroom_stream_rx(void) {
 
             case FSM_FIND_55:
                 if (b == 0x55) { s_rx_buf[1] = 0x55; s_body_idx = 2; s_fsm_state = FSM_READ_BODY; }
+                else if (b == 0xAA) { s_rx_buf[0] = 0xAA; s_fsm_state = FSM_FIND_55; }
                 else { s_fsm_state = FSM_IDLE; }
                 break;
 
@@ -290,13 +655,20 @@ static void handle_wroom_stream_rx(void) {
                         temp_pkt.emergency_code = s_rx_buf[32];
                         temp_pkt.checksum = s_rx_buf[33];
 
+                        if (temp_pkt.emergency_code != 0) s_voice_call_mode = true;
+
+                        bool wake = (temp_pkt.emergency_code != 0) || (temp_pkt.r1_detected == 1) || (temp_pkt.r2_detected == 1);
+                        for (int k = 0; k < 3; k++) {
+                            if (abs(temp_pkt.r1_y[k]) > 100 || abs(temp_pkt.r2_y[k]) > 100) { wake = true; break; }
+                        }
+
                         if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                             s_rx_radar_data = temp_pkt;
+                            if (wake) s_sleep_wake_timer = millis();
                             xSemaphoreGive(s_state_mutex);
                         }
                     }
-                    s_fsm_state = FSM_IDLE;
-                    s_body_idx = 0;
+                    s_fsm_state = FSM_IDLE; s_body_idx = 0;
                 }
                 break;
 
@@ -305,8 +677,7 @@ static void handle_wroom_stream_rx(void) {
                 break;
 
             case FSM_READ_VOICE_LEN:
-                s_voice_len = b;
-                s_voice_idx = 0;
+                s_voice_len = b; s_voice_idx = 0;
                 if (s_voice_len > 0 && s_voice_len <= 60) {
                     s_voice_buf[0] = 0xA5; s_voice_buf[1] = 0x5A; s_voice_buf[2] = (uint8_t)s_voice_len;
                     s_fsm_state = FSM_READ_VOICE_BODY;
@@ -318,30 +689,39 @@ static void handle_wroom_stream_rx(void) {
             case FSM_READ_VOICE_BODY:
                 s_voice_buf[3 + s_voice_idx++] = b;
                 if (s_voice_idx >= s_voice_len) {
-                    send_bytes_to_rpi(s_voice_buf, s_voice_len + 3);
+                    if (s_voice_call_mode) send_bytes_to_rpi(s_voice_buf, s_voice_len + 3);
                     s_fsm_state = FSM_IDLE;
                 }
                 break;
 
             case FSM_READ_TEXT:
                 if (b == '\n' || b == '\r') {
-                    s_txt_buf[s_txt_idx] = '\0';
-                    if (strcmp(s_txt_buf, "$CALL_START") == 0) {
-                        s_voice_call_mode = true;
-                        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            s_rx_radar_data.emergency_code = 1;
-                            xSemaphoreGive(s_state_mutex);
+                    if (s_txt_idx > 0) {
+                        s_txt_buf[s_txt_idx] = '\0';
+                        if (strstr(s_txt_buf, "$CALL_START") != NULL) {
+                            s_voice_call_mode = true;
+                            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                s_rx_radar_data.emergency_code = 1;
+                                xSemaphoreGive(s_state_mutex);
+                            }
+                            send_bytes_to_rpi("$CALL_START\n", 12);
+                        } else if (strstr(s_txt_buf, "$CALL_END") != NULL) {
+                            s_voice_call_mode = false;
+                            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                s_rx_radar_data.emergency_code = 0;
+                                xSemaphoreGive(s_state_mutex);
+                            }
+                            send_bytes_to_rpi("$CALL_END\n", 10);
+                        } else if (strncmp(s_txt_buf, "$AUDIO,", 7) == 0) {
+                            int bands[8] = {0};
+                            if (sscanf(s_txt_buf, "$AUDIO,%d,%d,%d,%d,%d,%d,%d,%d",
+                                       &bands[0], &bands[1], &bands[2], &bands[3],
+                                       &bands[4], &bands[5], &bands[6], &bands[7]) == 8) {
+                                for (int j = 0; j < 8; j++) s_audio_bands[j] = (uint8_t)bands[j];
+                            }
                         }
-                    } else if (strcmp(s_txt_buf, "$CALL_END") == 0) {
-                        s_voice_call_mode = false;
-                        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            s_rx_radar_data.emergency_code = 0;
-                            xSemaphoreGive(s_state_mutex);
-                        }
-                        send_bytes_to_rpi("$CALL_END\n", 10);
                     }
-                    s_fsm_state = FSM_IDLE;
-                    s_txt_idx = 0;
+                    s_fsm_state = FSM_IDLE; s_txt_idx = 0;
                 } else {
                     if (s_txt_idx < (int)sizeof(s_txt_buf) - 1) s_txt_buf[s_txt_idx++] = (char)b;
                 }
@@ -368,12 +748,15 @@ static void handle_rpi_rx(void) {
     }
 
     while (rpi_len > 0) {
+        // 1. 관제소 -> WROOM 다운링크 Codec 2 음성
         if (rpi_len >= 3 && rpi_buf[0] == 0x5A && rpi_buf[1] == 0xA5) {
             uint8_t c2_len = rpi_buf[2];
             if (rpi_len >= 3 + c2_len) {
-                if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    uart_write_bytes(WROOM_CTRL_UART_NUM, (const char *)rpi_buf, 3 + c2_len);
-                    xSemaphoreGive(s_wroom_tx_mutex);
+                if (s_voice_call_mode) {
+                    if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        uart_write_bytes(WROOM_CTRL_UART_NUM, (const char *)rpi_buf, 3 + c2_len);
+                        xSemaphoreGive(s_wroom_tx_mutex);
+                    }
                 }
                 rpi_len -= (3 + c2_len);
                 if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[3 + c2_len], rpi_len);
@@ -383,6 +766,7 @@ static void handle_rpi_rx(void) {
             }
         }
 
+        // 2. 관제소 통화 제어 명령
         if (rpi_len >= 9 && memcmp(rpi_buf, "$CALL_END", 9) == 0) {
             send_to_wroom("$CALL_END\n");
             s_voice_call_mode = false;
@@ -406,12 +790,14 @@ static void handle_rpi_rx(void) {
             continue;
         }
 
+        // 3. 16비트 폴링 및 제어 프레임
         if (rpi_len >= 2) {
             uint8_t rx_msb = rpi_buf[0];
             uint8_t rx_lsb = rpi_buf[1];
             uint8_t target_rail = rx_msb & 0x0F;
 
             if (target_rail == 0 || target_rail == MY_RAIL_SEQ) {
+                // [A] 관제 폴링 (0xFF)
                 if (rx_lsb == 0xFF) {
                     radar_rx_frame_t snap;
                     if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -452,52 +838,68 @@ static void handle_rpi_rx(void) {
                     continue;
                 }
 
+                // [B] 웹 제어 명령 처리
                 s_power_supply_mode = (rx_msb >> 6) & 0x03;
-                s_is_sleep_mode = (rx_lsb >> 7) & 0x01;
+                bool new_sleep = (rx_lsb >> 7) & 0x01;
+                if (new_sleep != s_is_sleep_mode) {
+                    s_is_sleep_mode = new_sleep;
+                    if (s_is_sleep_mode) {
+                        s_sleep_wake_timer = millis() - HOLD_TIME_MS - 1000;
+                        if (s_current_category == 2 || s_current_category == 3) {
+                            send_to_wroom("$MUSIC,OFF\n"); s_is_music_on = false;
+                        }
+                    } else {
+                        s_sleep_wake_timer = millis();
+                    }
+                }
+
                 s_is_projector_on = (rx_lsb >> 6) & 0x01;
                 uint8_t new_cat = (rx_lsb >> 4) & 0x03;
                 uint8_t new_sub = rx_lsb & 0x0F;
 
                 if (new_cat == 2) {
+                    bool was_not = (s_current_category != 2 && s_current_category != 3);
                     s_current_category = 2;
+                    if (was_not) { s_anim_frame = 0; clear_all_leds(); }
+
                     if (new_sub <= 2) {
-                        s_music_led_pattern = new_sub;
+                        if (s_music_led_pattern != new_sub || s_current_sub_mode != new_sub) {
+                            s_music_led_pattern = new_sub; s_current_sub_mode = new_sub; s_anim_frame = 0; clear_all_leds();
+                        }
                     } else if (new_sub >= 3 && new_sub <= 12) {
                         s_current_volume = (new_sub - 2) * 10;
-                        char cmd[32];
-                        snprintf(cmd, sizeof(cmd), "$CTRL,%d,%d,%d\n", s_current_volume, s_play_mode, s_target_track);
+                        char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,%d,%d\n", s_current_volume, s_play_mode, s_target_track);
                         send_to_wroom(cmd);
                     } else if (new_sub == 13) {
                         s_play_mode = 0;
-                        char cmd[32];
-                        snprintf(cmd, sizeof(cmd), "$CTRL,%d,0,%d\n", s_current_volume, s_target_track);
+                        char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,0,%d\n", s_current_volume, s_target_track);
                         send_to_wroom(cmd);
                     } else if (new_sub == 14) {
                         s_play_mode = 1;
-                        char cmd[32];
-                        snprintf(cmd, sizeof(cmd), "$CTRL,%d,1,%d\n", s_current_volume, s_target_track);
+                        char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,1,%d\n", s_current_volume, s_target_track);
                         send_to_wroom(cmd);
                     }
                 } else if (new_cat == 3) {
+                    bool was_not = (s_current_category != 2 && s_current_category != 3);
                     s_current_category = 2;
+                    if (was_not) { s_anim_frame = 0; clear_all_leds(); }
+
                     if (new_sub >= 1 && new_sub <= 15) {
-                        s_target_track = new_sub;
-                        s_play_mode = 2;
-                        char cmd[32];
-                        snprintf(cmd, sizeof(cmd), "$CTRL,%d,2,%d\n", s_current_volume, s_target_track);
+                        s_target_track = new_sub; s_play_mode = 2;
+                        char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,2,%d\n", s_current_volume, s_target_track);
                         send_to_wroom(cmd);
                     }
                 } else {
-                    if (s_current_category == 2 || s_current_category == 3) {
-                        send_to_wroom("$MUSIC,OFF\n");
-                        s_is_music_on = false;
+                    bool was_music = (s_current_category == 2 || s_current_category == 3);
+                    if (was_music) { send_to_wroom("$MUSIC,OFF\n"); s_is_music_on = false; }
+                    if (new_cat != s_current_category || new_sub != s_current_sub_mode) {
+                        s_current_category = new_cat; s_current_sub_mode = new_sub; s_anim_frame = 0; clear_all_leds();
                     }
-                    s_current_category = new_cat;
-                    s_current_sub_mode = new_sub;
                 }
 
                 uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, rx_lsb};
                 send_bytes_to_rpi(ack, 2);
+                update_power_relay_only();
 
                 rpi_len -= 2;
                 if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[2], rpi_len);
@@ -514,7 +916,6 @@ static void comm_task(void *pvParameters) {
     while (1) {
         handle_wroom_stream_rx();
         handle_rpi_rx();
-        // [수정] 10ms (1틱) 명시적 딜레이를 주어 IDLE1 태스크의 WDT 갱신을 100% 보장
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -523,13 +924,59 @@ static void presentation_task(void *pvParameters) {
     int64_t last_bat_check = 0;
     while (1) {
         int64_t now = millis();
+
         if (now - last_bat_check >= 1000) {
             last_bat_check = now;
             read_battery_and_calculate_pct();
+            update_power_relay_only();
         }
-        update_led_sequence();
+
+        if (s_is_sleep_mode) {
+            s_system_power_state = (now - s_sleep_wake_timer < HOLD_TIME_MS);
+        } else {
+            s_system_power_state = true;
+        }
+
+        if (s_system_power_state != s_last_power_state) {
+            s_last_power_state = s_system_power_state;
+            if (s_system_power_state) {
+                ESP_LOGI(TAG, "☀️ [SYSTEM WAKE] 시스템 가동");
+                s_is_music_on = false;
+            } else {
+                ESP_LOGI(TAG, "🌙 [SYSTEM SLEEP] 시스템 소등");
+                if (s_current_category == 2 || s_current_category == 3) {
+                    send_to_wroom("$MUSIC,OFF\n"); s_is_music_on = false;
+                }
+                memset(s_audio_bands, 0, sizeof(s_audio_bands));
+                clear_all_leds(); flush_led_strips();
+                gpio_set_level(PROJECTOR_PIN, 0);
+            }
+        }
+
+        if (s_system_power_state) {
+            update_led_sequence();
+            gpio_set_level(PROJECTOR_PIN, s_is_projector_on ? 1 : 0);
+
+            if ((s_current_category == 2 || s_current_category == 3) && !s_is_music_on) {
+                send_to_wroom("$MUSIC,ON\n"); s_is_music_on = true;
+            }
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+static void init_power_relays(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << RELAY_PIN) | (1ULL << PROJECTOR_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    gpio_set_level(RELAY_PIN, 1);
+    gpio_set_level(PROJECTOR_PIN, 1);
 }
 
 static void init_uarts(void) {
@@ -590,13 +1037,21 @@ void app_main(void) {
     s_wroom_tx_mutex = xSemaphoreCreateMutex();
     s_rpi_tx_mutex = xSemaphoreCreateMutex();
 
+    init_power_relays();
     init_uarts();
     init_i2c_bus();
     init_led_strips();
 
-    read_battery_and_calculate_pct();
+    for (uint8_t i = 0; i < NUM_COLUMNS; i++) {
+        s_column_state[i] = STATE_WAITING;
+        s_column_next_drop[i] = millis() + (rand() % 1900 + 100);
+    }
 
-    ESP_LOGI(TAG, "🚀 ESP32-P4 Codec2(2400bps) PLC 패스스루 가동 (Rail: %d)", MY_RAIL_SEQ);
+    read_battery_and_calculate_pct();
+    update_power_relay_only();
+    s_sleep_wake_timer = millis();
+
+    ESP_LOGI(TAG, "🚀 ESP32-P4 Non-Zero 39B + Codec2 통화 완전 통합 가동 (Rail: %d)", MY_RAIL_SEQ);
 
     xTaskCreatePinnedToCore(comm_task, "comm_task", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(presentation_task, "pres_task", 4096, NULL, 4, NULL, 0);
