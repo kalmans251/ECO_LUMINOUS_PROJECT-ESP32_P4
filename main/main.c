@@ -582,16 +582,253 @@ static void update_power_relay_only(void) {
 }
 
 static void send_to_wroom(const char *cmd) {
-    if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, portMAX_DELAY) == pdTRUE) {
         uart_write_bytes(WROOM_CTRL_UART_NUM, cmd, strlen(cmd));
         xSemaphoreGive(s_wroom_tx_mutex);
     }
 }
 
+static void send_bytes_to_wroom(const void *data, size_t len) {
+    if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, portMAX_DELAY) == pdTRUE) {
+        uart_write_bytes(WROOM_CTRL_UART_NUM, (const char *)data, len);
+        xSemaphoreGive(s_wroom_tx_mutex);
+    }
+}
+
 static void send_bytes_to_rpi(const void *data, size_t len) {
-    if (s_rpi_tx_mutex && xSemaphoreTake(s_rpi_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (s_rpi_tx_mutex && xSemaphoreTake(s_rpi_tx_mutex, portMAX_DELAY) == pdTRUE) {
         uart_write_bytes(RPI_UART_NUM, (const char *)data, len);
         xSemaphoreGive(s_rpi_tx_mutex);
+    }
+}
+
+typedef enum {
+    RPI_FSM_IDLE,
+    RPI_FSM_FIND_A5,
+    RPI_FSM_READ_C2_LEN,
+    RPI_FSM_READ_C2_DATA,
+    RPI_FSM_CMD_LSB,
+    RPI_FSM_TEXT
+} rpi_fsm_state_t;
+
+static void handle_rpi_rx(void) {
+    static rpi_fsm_state_t s_rpi_state = RPI_FSM_IDLE;
+    static uint8_t s_c2_down_buf[64];
+    static int s_c2_down_len = 0;
+    static int s_c2_down_idx = 0;
+    static uint8_t s_saved_msb = 0;
+    static char s_rpi_txt[64];
+    static int s_rpi_txt_idx = 0;
+
+    uint8_t temp[128];
+    int len = uart_read_bytes(RPI_UART_NUM, temp, sizeof(temp), 0);
+
+    for (int i = 0; i < len; i++) {
+        uint8_t b = temp[i];
+
+        switch (s_rpi_state) {
+        case RPI_FSM_IDLE:
+            if (b == 0x5A) {
+                s_rpi_state = RPI_FSM_FIND_A5;
+            } else if (b == '$') {
+                s_rpi_txt_idx = 0;
+                s_rpi_txt[s_rpi_txt_idx++] = (char)b;
+                s_rpi_state = RPI_FSM_TEXT;
+            } else {
+                s_saved_msb = b;
+                s_rpi_state = RPI_FSM_CMD_LSB;
+            }
+            break;
+
+        case RPI_FSM_FIND_A5:
+            if (b == 0xA5) {
+                s_rpi_state = RPI_FSM_READ_C2_LEN;
+            } else {
+                s_rpi_state = RPI_FSM_IDLE;
+            }
+            break;
+
+        case RPI_FSM_READ_C2_LEN:
+            s_c2_down_len = b;
+            s_c2_down_idx = 0;
+            if (s_c2_down_len > 0 && s_c2_down_len <= 48) {
+                s_c2_down_buf[0] = 0x5A;
+                s_c2_down_buf[1] = 0xA5;
+                s_c2_down_buf[2] = (uint8_t)s_c2_down_len;
+                s_rpi_state = RPI_FSM_READ_C2_DATA;
+            } else {
+                s_rpi_state = RPI_FSM_IDLE;
+            }
+            break;
+
+        case RPI_FSM_READ_C2_DATA:
+            s_c2_down_buf[3 + s_c2_down_idx++] = b;
+            if (s_c2_down_idx >= s_c2_down_len) {
+                if (s_voice_call_mode) {
+                    send_bytes_to_wroom(s_c2_down_buf, 3 + s_c2_down_len);
+                }
+                s_rpi_state = RPI_FSM_IDLE;
+            }
+            break;
+
+        case RPI_FSM_CMD_LSB: {
+            uint8_t rx_msb = s_saved_msb;
+            uint8_t rx_lsb = b;
+            uint8_t target_rail = rx_msb & 0x0F;
+
+            if (target_rail == 0 || target_rail == MY_RAIL_SEQ) {
+                if (rx_lsb == 0xDD) {
+                    s_voice_call_mode = true;
+                    if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                        s_rx_radar_data.emergency_code = 1;
+                        xSemaphoreGive(s_state_mutex);
+                    }
+                    send_to_wroom("$CALL_START\n");
+                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, 0xDD};
+                    send_bytes_to_rpi(ack, 2);
+                    ESP_LOGI(TAG, "📞 [통화 시작] 수신 완료");
+                }
+                else if (rx_lsb == 0xEE) {
+                    s_voice_call_mode = false;
+                    if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                        s_rx_radar_data.emergency_code = 0;
+                        xSemaphoreGive(s_state_mutex);
+                    }
+                    send_to_wroom("$CALL_END\n");
+                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, 0xEE};
+                    send_bytes_to_rpi(ack, 2);
+                    ESP_LOGI(TAG, "🔴 [통화 종료] 수신 완료");
+                }
+                else if (rx_lsb == 0xFF) {
+                    radar_rx_frame_t snap;
+                    if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                        snap = s_rx_radar_data;
+                        xSemaphoreGive(s_state_mutex);
+                    }
+
+                    uint8_t curr_msb = ((s_power_supply_mode & 0x03) << 6) | (MY_RAIL_SEQ & 0x0F);
+                    uint8_t rep_cat  = (s_current_category == 3) ? 2 : s_current_category;
+                    uint8_t rep_sub  = (rep_cat == 2) ? s_music_led_pattern : s_current_sub_mode;
+                    uint8_t curr_lsb = ((s_is_sleep_mode ? 1 : 0) << 7) |
+                                       ((s_is_projector_on ? 1 : 0) << 6) |
+                                       ((rep_cat & 0x03) << 4) | (rep_sub & 0x0F);
+
+                    uint8_t raw[39] = {0};
+                    raw[0] = (uint8_t)MY_RAIL_SEQ;
+                    raw[1] = (uint8_t)((s_latest_l_mw >> 8) & 0xFF); raw[2] = (uint8_t)(s_latest_l_mw & 0xFF);
+                    raw[3] = (uint8_t)((s_latest_r_mw >> 8) & 0xFF); raw[4] = (uint8_t)(s_latest_r_mw & 0xFF);
+                    raw[5] = curr_msb; raw[6] = curr_lsb; raw[7] = s_latest_bat_pct;
+                    raw[8] = (uint8_t)((snap.in_count >> 8) & 0xFF); raw[9] = (uint8_t)(snap.in_count & 0xFF);
+                    raw[10] = (uint8_t)((snap.out_count >> 8) & 0xFF); raw[11] = (uint8_t)(snap.out_count & 0xFF);
+
+                    for (int k = 0; k < 3; k++) {
+                        raw[12 + (k*2)] = (uint8_t)((snap.r1_x[k] >> 8) & 0xFF); raw[13 + (k*2)] = (uint8_t)(snap.r1_x[k] & 0xFF);
+                        raw[18 + (k*2)] = (uint8_t)((snap.r1_y[k] >> 8) & 0xFF); raw[19 + (k*2)] = (uint8_t)(snap.r1_y[k] & 0xFF);
+                        raw[24 + (k*2)] = (uint8_t)((snap.r2_x[k] >> 8) & 0xFF); raw[25 + (k*2)] = (uint8_t)(snap.r2_x[k] & 0xFF);
+                        raw[30 + (k*2)] = (uint8_t)((snap.r2_y[k] >> 8) & 0xFF); raw[31 + (k*2)] = (uint8_t)(snap.r2_y[k] & 0xFF);
+                    }
+                    raw[36] = snap.r1_detected; raw[37] = snap.r2_detected;
+                    raw[38] = s_voice_call_mode ? 1 : 0;
+
+                    uint8_t tf_encoded[39];
+                    for (int j = 0; j < 39; j++) tf_encoded[j] = (uint8_t)((raw[j] + 0x20) & 0xFF);
+                    send_bytes_to_rpi(tf_encoded, 39);
+                }
+                else {
+                    s_power_supply_mode = (rx_msb >> 6) & 0x03;
+                    bool new_sleep = (rx_lsb >> 7) & 0x01;
+                    if (new_sleep != s_is_sleep_mode) {
+                        s_is_sleep_mode = new_sleep;
+                        if (s_is_sleep_mode) {
+                            s_sleep_wake_timer = millis() - HOLD_TIME_MS - 1000;
+                            if (s_current_category == 2 || s_current_category == 3) {
+                                send_to_wroom("$MUSIC,OFF\n"); s_is_music_on = false;
+                            }
+                        } else {
+                            s_sleep_wake_timer = millis();
+                        }
+                    }
+
+                    s_is_projector_on = (rx_lsb >> 6) & 0x01;
+                    uint8_t new_cat = (rx_lsb >> 4) & 0x03;
+                    uint8_t new_sub = rx_lsb & 0x0F;
+
+                    if (new_cat == 2) {
+                        bool was_not = (s_current_category != 2 && s_current_category != 3);
+                        s_current_category = 2;
+                        if (was_not) { s_anim_frame = 0; clear_all_leds(); }
+
+                        if (new_sub <= 2) {
+                            if (s_music_led_pattern != new_sub || s_current_sub_mode != new_sub) {
+                                s_music_led_pattern = new_sub; s_current_sub_mode = new_sub; s_anim_frame = 0; clear_all_leds();
+                            }
+                        } else if (new_sub >= 3 && new_sub <= 12) {
+                            s_current_volume = (new_sub - 2) * 10;
+                            char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,%d,%d\n", s_current_volume, s_play_mode, s_target_track);
+                            send_to_wroom(cmd);
+                        } else if (new_sub == 13) {
+                            s_play_mode = 0;
+                            char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,0,%d\n", s_current_volume, s_target_track);
+                            send_to_wroom(cmd);
+                        } else if (new_sub == 14) {
+                            s_play_mode = 1;
+                            char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,1,%d\n", s_current_volume, s_target_track);
+                            send_to_wroom(cmd);
+                        }
+                    } else if (new_cat == 3) {
+                        bool was_not = (s_current_category != 2 && s_current_category != 3);
+                        s_current_category = 2;
+                        if (was_not) { s_anim_frame = 0; clear_all_leds(); }
+
+                        if (new_sub >= 1 && new_sub <= 15) {
+                            s_target_track = new_sub; s_play_mode = 2;
+                            char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,2,%d\n", s_current_volume, s_target_track);
+                            send_to_wroom(cmd);
+                        }
+                    } 
+                    // [핵심 2] 일반 조명(0, 1)으로 변경 시 노래 끄기 강제 발동
+                    else {
+                        if (s_is_music_on || s_current_category == 2 || s_current_category == 3) { 
+                            send_to_wroom("$MUSIC,OFF\n"); 
+                            s_is_music_on = false; 
+                            ESP_LOGW(TAG, "🎵 음악 모드 해제 -> $MUSIC,OFF 전송");
+                        }
+                        if (new_cat != s_current_category || new_sub != s_current_sub_mode) {
+                            s_current_category = new_cat; s_current_sub_mode = new_sub; s_anim_frame = 0; clear_all_leds();
+                        }
+                    }
+
+                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, rx_lsb};
+                    send_bytes_to_rpi(ack, 2);
+                    update_power_relay_only();
+                }
+            }
+            s_rpi_state = RPI_FSM_IDLE;
+            break;
+        }
+
+        case RPI_FSM_TEXT:
+            if (b == '\n' || b == '\r') {
+                if (s_rpi_txt_idx > 0) {
+                    s_rpi_txt[s_rpi_txt_idx] = '\0';
+                    if (strstr(s_rpi_txt, "$CALL_END") != NULL) {
+                        s_voice_call_mode = false;
+                        if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                            s_rx_radar_data.emergency_code = 0;
+                            xSemaphoreGive(s_state_mutex);
+                        }
+                        send_to_wroom("$CALL_END\n");
+                    }
+                }
+                s_rpi_state = RPI_FSM_IDLE;
+                s_rpi_txt_idx = 0;
+            } else {
+                if (s_rpi_txt_idx < (int)sizeof(s_rpi_txt) - 1) {
+                    s_rpi_txt[s_rpi_txt_idx++] = (char)b;
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -654,7 +891,7 @@ static void handle_wroom_stream_rx(void) {
                             if (abs(temp_pkt.r1_y[k]) > 100 || abs(temp_pkt.r2_y[k]) > 100) { wake = true; break; }
                         }
 
-                        if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
                             s_rx_radar_data = temp_pkt;
                             if (wake) s_sleep_wake_timer = millis();
                             xSemaphoreGive(s_state_mutex);
@@ -681,10 +918,8 @@ static void handle_wroom_stream_rx(void) {
             case FSM_READ_VOICE_BODY:
                 s_voice_buf[3 + s_voice_idx++] = b;
                 if (s_voice_idx >= s_voice_len) {
-                    // [PLC 핵심] 음성 전송 후 반드시 35ms 무전송 갭을 두어 RPi의 종료 명령 충돌을 방지!
                     if (s_voice_call_mode) {
                         send_bytes_to_rpi(s_voice_buf, s_voice_len + 3);
-                        vTaskDelay(pdMS_TO_TICKS(35));
                     }
                     s_fsm_state = FSM_IDLE;
                 }
@@ -696,20 +931,18 @@ static void handle_wroom_stream_rx(void) {
                         s_txt_buf[s_txt_idx] = '\0';
                         if (strstr(s_txt_buf, "$CALL_START") != NULL) {
                             s_voice_call_mode = true;
-                            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
                                 s_rx_radar_data.emergency_code = 1;
                                 xSemaphoreGive(s_state_mutex);
                             }
                             send_bytes_to_rpi("$CALL_START\n", 12);
-                            ESP_LOGW(TAG, "🚨 [WROOM -> P4] 현장 비상 호출 시작");
                         } else if (strstr(s_txt_buf, "$CALL_END") != NULL) {
                             s_voice_call_mode = false;
-                            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
                                 s_rx_radar_data.emergency_code = 0;
                                 xSemaphoreGive(s_state_mutex);
                             }
                             send_bytes_to_rpi("$CALL_END\n", 10);
-                            ESP_LOGW(TAG, "🔴 [WROOM -> P4] 현장 비상 호출 종료");
                         } else if (strncmp(s_txt_buf, "$AUDIO,", 7) == 0) {
                             int bands[8] = {0};
                             if (sscanf(s_txt_buf, "$AUDIO,%d,%d,%d,%d,%d,%d,%d,%d",
@@ -729,224 +962,11 @@ static void handle_wroom_stream_rx(void) {
     }
 }
 
-// =============================================================================
-// [핵심] 1바이트 단위 즉각 인터럽트 검사 (충돌로 깨진 프레임 속에서도 0xEE 추출)
-// =============================================================================
-static void handle_rpi_rx(void) {
-    static uint8_t rpi_buf[512];
-    static int rpi_len = 0;
-
-    uint8_t temp[64];
-    int len = uart_read_bytes(RPI_UART_NUM, temp, sizeof(temp), 0);
-
-    if (len > 0) {
-        // [초고속 가로채기 1] 들어온 바이트 중 0xEE (통화 종료)가 보이면 버퍼 처리 전 즉시 탈출
-        for (int b_idx = 0; b_idx < len; b_idx++) {
-            if (temp[b_idx] == 0xEE) {
-                s_voice_call_mode = false;
-                if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                    s_rx_radar_data.emergency_code = 0;
-                    xSemaphoreGive(s_state_mutex);
-                }
-                send_to_wroom("$CALL_END\n");
-                send_to_wroom("$CALL_END\n");
-                ESP_LOGW(TAG, "🔴 [P4 하드웨어 인터럽트] 0xEE 감지 -> 통화 1클릭 즉시 해제!");
-                rpi_len = 0;
-                return;
-            }
-        }
-
-        if (rpi_len + len < (int)sizeof(rpi_buf)) {
-            memcpy(&rpi_buf[rpi_len], temp, len);
-            rpi_len += len;
-        } else {
-            rpi_len = 0;
-        }
-    }
-
-    // [초고속 가로채기 2] 텍스트 $CALL_END 검사
-    if (rpi_len >= 9) {
-        for (int i = 0; i <= rpi_len - 9; i++) {
-            if (memcmp(&rpi_buf[i], "$CALL_END", 9) == 0) {
-                s_voice_call_mode = false;
-                if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                    s_rx_radar_data.emergency_code = 0;
-                    xSemaphoreGive(s_state_mutex);
-                }
-                send_to_wroom("$CALL_END\n");
-                send_to_wroom("$CALL_END\n");
-                ESP_LOGW(TAG, "🔴 [P4 텍스트 인터럽트] $CALL_END 감지 -> 통화 즉시 해제!");
-                rpi_len = 0;
-                return;
-            }
-        }
-    }
-
-    while (rpi_len > 0) {
-        // [A] 바이너리 2바이트 제어 명령
-        if (rpi_len >= 2 && rpi_buf[0] != 0x5A && rpi_buf[0] != '$') {
-            uint8_t rx_msb = rpi_buf[0];
-            uint8_t rx_lsb = rpi_buf[1];
-            uint8_t target_rail = rx_msb & 0x0F;
-
-            if (target_rail == 0 || target_rail == MY_RAIL_SEQ) {
-                // 1. 통화 시작 바이너리 (0xDD)
-                if (rx_lsb == 0xDD) {
-                    s_voice_call_mode = true;
-                    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-                        s_rx_radar_data.emergency_code = 1;
-                        xSemaphoreGive(s_state_mutex);
-                    }
-                    send_to_wroom("$CALL_START\n");
-                    ESP_LOGW(TAG, "🚨 [P4] 통화 시작 확정 (바이너리 0xDD)");
-
-                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, 0xDD};
-                    send_bytes_to_rpi(ack, 2);
-
-                    rpi_len -= 2;
-                    if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[2], rpi_len);
-                    continue;
-                }
-
-                // 2. 39B 상태 폴링 (0xFF)
-                if (rx_lsb == 0xFF) {
-                    radar_rx_frame_t snap;
-                    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                        snap = s_rx_radar_data;
-                        xSemaphoreGive(s_state_mutex);
-                    }
-
-                    uint8_t curr_msb = ((s_power_supply_mode & 0x03) << 6) | (MY_RAIL_SEQ & 0x0F);
-                    uint8_t rep_cat  = (s_current_category == 3) ? 2 : s_current_category;
-                    uint8_t rep_sub  = (rep_cat == 2) ? s_music_led_pattern : s_current_sub_mode;
-                    uint8_t curr_lsb = ((s_is_sleep_mode ? 1 : 0) << 7) |
-                                       ((s_is_projector_on ? 1 : 0) << 6) |
-                                       ((rep_cat & 0x03) << 4) | (rep_sub & 0x0F);
-
-                    uint8_t raw[39] = {0};
-                    raw[0] = (uint8_t)MY_RAIL_SEQ;
-                    raw[1] = (uint8_t)((s_latest_l_mw >> 8) & 0xFF); raw[2] = (uint8_t)(s_latest_l_mw & 0xFF);
-                    raw[3] = (uint8_t)((s_latest_r_mw >> 8) & 0xFF); raw[4] = (uint8_t)(s_latest_r_mw & 0xFF);
-                    raw[5] = curr_msb; raw[6] = curr_lsb; raw[7] = s_latest_bat_pct;
-                    raw[8] = (uint8_t)((snap.in_count >> 8) & 0xFF); raw[9] = (uint8_t)(snap.in_count & 0xFF);
-                    raw[10] = (uint8_t)((snap.out_count >> 8) & 0xFF); raw[11] = (uint8_t)(snap.out_count & 0xFF);
-
-                    for (int k = 0; k < 3; k++) {
-                        raw[12 + (k*2)] = (uint8_t)((snap.r1_x[k] >> 8) & 0xFF); raw[13 + (k*2)] = (uint8_t)(snap.r1_x[k] & 0xFF);
-                        raw[18 + (k*2)] = (uint8_t)((snap.r1_y[k] >> 8) & 0xFF); raw[19 + (k*2)] = (uint8_t)(snap.r1_y[k] & 0xFF);
-                        raw[24 + (k*2)] = (uint8_t)((snap.r2_x[k] >> 8) & 0xFF); raw[25 + (k*2)] = (uint8_t)(snap.r2_x[k] & 0xFF);
-                        raw[30 + (k*2)] = (uint8_t)((snap.r2_y[k] >> 8) & 0xFF); raw[31 + (k*2)] = (uint8_t)(snap.r2_y[k] & 0xFF);
-                    }
-                    raw[36] = snap.r1_detected; raw[37] = snap.r2_detected;
-                    raw[38] = s_voice_call_mode ? 1 : 0;
-
-                    uint8_t tf_encoded[39];
-                    for (int j = 0; j < 39; j++) tf_encoded[j] = (uint8_t)((raw[j] + 0x20) & 0xFF);
-                    send_bytes_to_rpi(tf_encoded, 39);
-
-                    rpi_len -= 2;
-                    if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[2], rpi_len);
-                    continue;
-                }
-
-                // 3. 일반 조명/전원 모드
-                s_power_supply_mode = (rx_msb >> 6) & 0x03;
-                bool new_sleep = (rx_lsb >> 7) & 0x01;
-                if (new_sleep != s_is_sleep_mode) {
-                    s_is_sleep_mode = new_sleep;
-                    if (s_is_sleep_mode) {
-                        s_sleep_wake_timer = millis() - HOLD_TIME_MS - 1000;
-                        if (s_current_category == 2 || s_current_category == 3) {
-                            send_to_wroom("$MUSIC,OFF\n"); s_is_music_on = false;
-                        }
-                    } else {
-                        s_sleep_wake_timer = millis();
-                    }
-                }
-
-                s_is_projector_on = (rx_lsb >> 6) & 0x01;
-                uint8_t new_cat = (rx_lsb >> 4) & 0x03;
-                uint8_t new_sub = rx_lsb & 0x0F;
-
-                if (new_cat == 2) {
-                    bool was_not = (s_current_category != 2 && s_current_category != 3);
-                    s_current_category = 2;
-                    if (was_not) { s_anim_frame = 0; clear_all_leds(); }
-
-                    if (new_sub <= 2) {
-                        if (s_music_led_pattern != new_sub || s_current_sub_mode != new_sub) {
-                            s_music_led_pattern = new_sub; s_current_sub_mode = new_sub; s_anim_frame = 0; clear_all_leds();
-                        }
-                    } else if (new_sub >= 3 && new_sub <= 12) {
-                        s_current_volume = (new_sub - 2) * 10;
-                        char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,%d,%d\n", s_current_volume, s_play_mode, s_target_track);
-                        send_to_wroom(cmd);
-                    } else if (new_sub == 13) {
-                        s_play_mode = 0;
-                        char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,0,%d\n", s_current_volume, s_target_track);
-                        send_to_wroom(cmd);
-                    } else if (new_sub == 14) {
-                        s_play_mode = 1;
-                        char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,1,%d\n", s_current_volume, s_target_track);
-                        send_to_wroom(cmd);
-                    }
-                } else if (new_cat == 3) {
-                    bool was_not = (s_current_category != 2 && s_current_category != 3);
-                    s_current_category = 2;
-                    if (was_not) { s_anim_frame = 0; clear_all_leds(); }
-
-                    if (new_sub >= 1 && new_sub <= 15) {
-                        s_target_track = new_sub; s_play_mode = 2;
-                        char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,2,%d\n", s_current_volume, s_target_track);
-                        send_to_wroom(cmd);
-                    }
-                } else {
-                    bool was_music = (s_current_category == 2 || s_current_category == 3);
-                    if (was_music) { send_to_wroom("$MUSIC,OFF\n"); s_is_music_on = false; }
-                    if (new_cat != s_current_category || new_sub != s_current_sub_mode) {
-                        s_current_category = new_cat; s_current_sub_mode = new_sub; s_anim_frame = 0; clear_all_leds();
-                    }
-                }
-
-                uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, rx_lsb};
-                send_bytes_to_rpi(ack, 2);
-                update_power_relay_only();
-
-                rpi_len -= 2;
-                if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[2], rpi_len);
-                continue;
-            }
-        }
-
-        // [B] 다운링크 오디오 스트림
-        if (rpi_len >= 3 && rpi_buf[0] == 0x5A && rpi_buf[1] == 0xA5) {
-            uint8_t c2_len = rpi_buf[2];
-            if (rpi_len >= 3 + c2_len) {
-                if (s_voice_call_mode) {
-                    if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                        uart_write_bytes(WROOM_CTRL_UART_NUM, (const char *)rpi_buf, 3 + c2_len);
-                        xSemaphoreGive(s_wroom_tx_mutex);
-                    }
-                }
-                rpi_len -= (3 + c2_len);
-                if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[3 + c2_len], rpi_len);
-                continue;
-            } else {
-                break;
-            }
-        }
-
-        // 쓰레기 바이트 1바이트 폐기
-        rpi_len -= 1;
-        if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[1], rpi_len);
-    }
-}
-
 static void comm_task(void *pvParameters) {
     while (1) {
         handle_wroom_stream_rx();
         handle_rpi_rx();
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(1);
     }
 }
 
