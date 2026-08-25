@@ -100,14 +100,12 @@ static volatile int64_t  s_sleep_wake_timer  = 0;
 static volatile bool     s_system_power_state = true;
 static bool              s_last_power_state   = true;
 
-// 빗방울 매트릭스 변수
 #define NUM_COLUMNS 8
 static const uint8_t RAIN_COLUMNS[NUM_COLUMNS] = {2, 6, 10, 14, 18, 22, 26, 29};
 typedef enum { STATE_WAITING, STATE_FALLING } drop_state_t;
 static drop_state_t s_column_state[NUM_COLUMNS];
 static int64_t s_column_next_drop[NUM_COLUMNS] = {0};
 
-// 음향 반응 필터
 static uint8_t s_audio_bands[8] = {0};
 static float s_smooth_bass = 0.0f;
 static float s_smooth_acoustic = 0.0f;
@@ -196,7 +194,6 @@ static void update_led_sequence(void) {
     static int64_t last_led_update = 0;
     bool need_show = false;
 
-    // 0. 비상 통화 모드 (적색 긴급 브리딩 점등)
     if (s_voice_call_mode) {
         if (current_millis - last_led_update > 30) {
             last_led_update = current_millis;
@@ -212,10 +209,9 @@ static void update_led_sequence(void) {
         return;
     }
 
-    // 1. 카테고리 0: 일반 조명 모드 (1~7)
     if (s_current_category == 0) {
         switch (s_current_sub_mode) {
-            case 1: // 레인보우 웨이브
+            case 1:
                 if (current_millis - last_led_update > 10) {
                     last_led_update = current_millis;
                     uint8_t base_hue = (uint8_t)(s_anim_frame * 2);
@@ -230,7 +226,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            case 2: // 2D Cyan 스윕
+            case 2:
                 if (current_millis - last_led_update > 80) {
                     last_led_update = current_millis;
                     clear_all_leds();
@@ -240,7 +236,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            case 3: // 보라/시안 웨이브
+            case 3:
                 if (current_millis - last_led_update > 20) {
                     last_led_update = current_millis;
                     for (uint8_t r = 0; r < NUM_ROWS; r++) {
@@ -253,7 +249,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            case 4: // 네온 스네이크
+            case 4:
                 if (current_millis - last_led_update > 10) {
                     last_led_update = current_millis;
                     clear_all_leds();
@@ -267,7 +263,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            case 5: // 듀얼 센터 확장
+            case 5:
                 if (current_millis - last_led_update > 30) {
                     last_led_update = current_millis;
                     clear_all_leds();
@@ -284,7 +280,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            case 6: // 빗방울 매트릭스
+            case 6:
                 if (current_millis - last_led_update > 60) {
                     last_led_update = current_millis;
                     for (int i = 0; i < NUM_LEDS; i++) {
@@ -312,7 +308,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            case 7: // 교차 스트로브
+            case 7:
                 if (current_millis - last_led_update > 250) {
                     last_led_update = current_millis;
                     clear_all_leds();
@@ -334,10 +330,9 @@ static void update_led_sequence(void) {
                 clear_all_leds(); need_show = true; break;
         }
     }
-    // 2. 카테고리 1: 센서 반응 모드 (1~2)
     else if (s_current_category == 1) {
         switch (s_current_sub_mode) {
-            case 1: // 앰버 골드 사인
+            case 1:
                 if (current_millis - last_led_update > 30) {
                     last_led_update = current_millis;
                     for (uint8_t r = 0; r < NUM_ROWS; r++) {
@@ -350,7 +345,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            case 2: // 스파클
+            case 2:
                 if (current_millis - last_led_update > 40) {
                     last_led_update = current_millis;
                     clear_all_leds();
@@ -379,10 +374,9 @@ static void update_led_sequence(void) {
                 break;
         }
     }
-    // 3. 카테고리 2/3: 뮤직/스펙트럼 반응 모드 (0~2)
     else if (s_current_category == 2 || s_current_category == 3) {
         switch (s_music_led_pattern) {
-            case 0: // 어쿠스틱 리플
+            case 0:
                 if (current_millis - last_led_update > 15) {
                     last_led_update = current_millis;
                     clear_all_leds();
@@ -428,7 +422,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            case 1: // 베이스 임팩트 스트림
+            case 1:
                 if (current_millis - last_led_update > 12) {
                     last_led_update = current_millis;
                     clear_all_leds();
@@ -472,7 +466,7 @@ static void update_led_sequence(void) {
                     s_anim_frame++; need_show = true;
                 }
                 break;
-            default: // 센터 방사형 이퀄라이저
+            default:
                 if (current_millis - last_led_update > 12) {
                     last_led_update = current_millis;
                     clear_all_leds();
@@ -652,10 +646,8 @@ static void handle_wroom_stream_rx(void) {
                         }
                         temp_pkt.r1_detected = s_rx_buf[30];
                         temp_pkt.r2_detected = s_rx_buf[31];
-                        temp_pkt.emergency_code = s_rx_buf[32];
+                        temp_pkt.emergency_code = s_voice_call_mode ? 1 : 0;
                         temp_pkt.checksum = s_rx_buf[33];
-
-                        if (temp_pkt.emergency_code != 0) s_voice_call_mode = true;
 
                         bool wake = (temp_pkt.emergency_code != 0) || (temp_pkt.r1_detected == 1) || (temp_pkt.r2_detected == 1);
                         for (int k = 0; k < 3; k++) {
@@ -689,7 +681,11 @@ static void handle_wroom_stream_rx(void) {
             case FSM_READ_VOICE_BODY:
                 s_voice_buf[3 + s_voice_idx++] = b;
                 if (s_voice_idx >= s_voice_len) {
-                    if (s_voice_call_mode) send_bytes_to_rpi(s_voice_buf, s_voice_len + 3);
+                    // [PLC 핵심] 음성 전송 후 반드시 35ms 무전송 갭을 두어 RPi의 종료 명령 충돌을 방지!
+                    if (s_voice_call_mode) {
+                        send_bytes_to_rpi(s_voice_buf, s_voice_len + 3);
+                        vTaskDelay(pdMS_TO_TICKS(35));
+                    }
                     s_fsm_state = FSM_IDLE;
                 }
                 break;
@@ -705,6 +701,7 @@ static void handle_wroom_stream_rx(void) {
                                 xSemaphoreGive(s_state_mutex);
                             }
                             send_bytes_to_rpi("$CALL_START\n", 12);
+                            ESP_LOGW(TAG, "🚨 [WROOM -> P4] 현장 비상 호출 시작");
                         } else if (strstr(s_txt_buf, "$CALL_END") != NULL) {
                             s_voice_call_mode = false;
                             if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -712,6 +709,7 @@ static void handle_wroom_stream_rx(void) {
                                 xSemaphoreGive(s_state_mutex);
                             }
                             send_bytes_to_rpi("$CALL_END\n", 10);
+                            ESP_LOGW(TAG, "🔴 [WROOM -> P4] 현장 비상 호출 종료");
                         } else if (strncmp(s_txt_buf, "$AUDIO,", 7) == 0) {
                             int bands[8] = {0};
                             if (sscanf(s_txt_buf, "$AUDIO,%d,%d,%d,%d,%d,%d,%d,%d",
@@ -731,14 +729,33 @@ static void handle_wroom_stream_rx(void) {
     }
 }
 
+// =============================================================================
+// [핵심] 1바이트 단위 즉각 인터럽트 검사 (충돌로 깨진 프레임 속에서도 0xEE 추출)
+// =============================================================================
 static void handle_rpi_rx(void) {
-    static uint8_t rpi_buf[256];
+    static uint8_t rpi_buf[512];
     static int rpi_len = 0;
 
     uint8_t temp[64];
     int len = uart_read_bytes(RPI_UART_NUM, temp, sizeof(temp), 0);
 
     if (len > 0) {
+        // [초고속 가로채기 1] 들어온 바이트 중 0xEE (통화 종료)가 보이면 버퍼 처리 전 즉시 탈출
+        for (int b_idx = 0; b_idx < len; b_idx++) {
+            if (temp[b_idx] == 0xEE) {
+                s_voice_call_mode = false;
+                if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    s_rx_radar_data.emergency_code = 0;
+                    xSemaphoreGive(s_state_mutex);
+                }
+                send_to_wroom("$CALL_END\n");
+                send_to_wroom("$CALL_END\n");
+                ESP_LOGW(TAG, "🔴 [P4 하드웨어 인터럽트] 0xEE 감지 -> 통화 1클릭 즉시 해제!");
+                rpi_len = 0;
+                return;
+            }
+        }
+
         if (rpi_len + len < (int)sizeof(rpi_buf)) {
             memcpy(&rpi_buf[rpi_len], temp, len);
             rpi_len += len;
@@ -747,57 +764,51 @@ static void handle_rpi_rx(void) {
         }
     }
 
-    while (rpi_len > 0) {
-        // 1. 관제소 -> WROOM 다운링크 Codec 2 음성
-        if (rpi_len >= 3 && rpi_buf[0] == 0x5A && rpi_buf[1] == 0xA5) {
-            uint8_t c2_len = rpi_buf[2];
-            if (rpi_len >= 3 + c2_len) {
-                if (s_voice_call_mode) {
-                    if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-                        uart_write_bytes(WROOM_CTRL_UART_NUM, (const char *)rpi_buf, 3 + c2_len);
-                        xSemaphoreGive(s_wroom_tx_mutex);
-                    }
+    // [초고속 가로채기 2] 텍스트 $CALL_END 검사
+    if (rpi_len >= 9) {
+        for (int i = 0; i <= rpi_len - 9; i++) {
+            if (memcmp(&rpi_buf[i], "$CALL_END", 9) == 0) {
+                s_voice_call_mode = false;
+                if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    s_rx_radar_data.emergency_code = 0;
+                    xSemaphoreGive(s_state_mutex);
                 }
-                rpi_len -= (3 + c2_len);
-                if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[3 + c2_len], rpi_len);
-                continue;
-            } else {
-                break;
+                send_to_wroom("$CALL_END\n");
+                send_to_wroom("$CALL_END\n");
+                ESP_LOGW(TAG, "🔴 [P4 텍스트 인터럽트] $CALL_END 감지 -> 통화 즉시 해제!");
+                rpi_len = 0;
+                return;
             }
         }
+    }
 
-        // 2. 관제소 통화 제어 명령
-        if (rpi_len >= 9 && memcmp(rpi_buf, "$CALL_END", 9) == 0) {
-            send_to_wroom("$CALL_END\n");
-            s_voice_call_mode = false;
-            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                s_rx_radar_data.emergency_code = 0;
-                xSemaphoreGive(s_state_mutex);
-            }
-            rpi_len -= 9;
-            if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[9], rpi_len);
-            continue;
-        }
-        if (rpi_len >= 11 && memcmp(rpi_buf, "$CALL_START", 11) == 0) {
-            send_to_wroom("$CALL_START\n");
-            s_voice_call_mode = true;
-            if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                s_rx_radar_data.emergency_code = 1;
-                xSemaphoreGive(s_state_mutex);
-            }
-            rpi_len -= 11;
-            if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[11], rpi_len);
-            continue;
-        }
-
-        // 3. 16비트 폴링 및 제어 프레임
-        if (rpi_len >= 2) {
+    while (rpi_len > 0) {
+        // [A] 바이너리 2바이트 제어 명령
+        if (rpi_len >= 2 && rpi_buf[0] != 0x5A && rpi_buf[0] != '$') {
             uint8_t rx_msb = rpi_buf[0];
             uint8_t rx_lsb = rpi_buf[1];
             uint8_t target_rail = rx_msb & 0x0F;
 
             if (target_rail == 0 || target_rail == MY_RAIL_SEQ) {
-                // [A] 관제 폴링 (0xFF)
+                // 1. 통화 시작 바이너리 (0xDD)
+                if (rx_lsb == 0xDD) {
+                    s_voice_call_mode = true;
+                    if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+                        s_rx_radar_data.emergency_code = 1;
+                        xSemaphoreGive(s_state_mutex);
+                    }
+                    send_to_wroom("$CALL_START\n");
+                    ESP_LOGW(TAG, "🚨 [P4] 통화 시작 확정 (바이너리 0xDD)");
+
+                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, 0xDD};
+                    send_bytes_to_rpi(ack, 2);
+
+                    rpi_len -= 2;
+                    if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[2], rpi_len);
+                    continue;
+                }
+
+                // 2. 39B 상태 폴링 (0xFF)
                 if (rx_lsb == 0xFF) {
                     radar_rx_frame_t snap;
                     if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -827,7 +838,7 @@ static void handle_rpi_rx(void) {
                         raw[30 + (k*2)] = (uint8_t)((snap.r2_y[k] >> 8) & 0xFF); raw[31 + (k*2)] = (uint8_t)(snap.r2_y[k] & 0xFF);
                     }
                     raw[36] = snap.r1_detected; raw[37] = snap.r2_detected;
-                    raw[38] = s_voice_call_mode ? 1 : snap.emergency_code;
+                    raw[38] = s_voice_call_mode ? 1 : 0;
 
                     uint8_t tf_encoded[39];
                     for (int j = 0; j < 39; j++) tf_encoded[j] = (uint8_t)((raw[j] + 0x20) & 0xFF);
@@ -838,7 +849,7 @@ static void handle_rpi_rx(void) {
                     continue;
                 }
 
-                // [B] 웹 제어 명령 처리
+                // 3. 일반 조명/전원 모드
                 s_power_supply_mode = (rx_msb >> 6) & 0x03;
                 bool new_sleep = (rx_lsb >> 7) & 0x01;
                 if (new_sleep != s_is_sleep_mode) {
@@ -907,8 +918,27 @@ static void handle_rpi_rx(void) {
             }
         }
 
+        // [B] 다운링크 오디오 스트림
+        if (rpi_len >= 3 && rpi_buf[0] == 0x5A && rpi_buf[1] == 0xA5) {
+            uint8_t c2_len = rpi_buf[2];
+            if (rpi_len >= 3 + c2_len) {
+                if (s_voice_call_mode) {
+                    if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                        uart_write_bytes(WROOM_CTRL_UART_NUM, (const char *)rpi_buf, 3 + c2_len);
+                        xSemaphoreGive(s_wroom_tx_mutex);
+                    }
+                }
+                rpi_len -= (3 + c2_len);
+                if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[3 + c2_len], rpi_len);
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        // 쓰레기 바이트 1바이트 폐기
         rpi_len -= 1;
-        memmove(rpi_buf, &rpi_buf[1], rpi_len);
+        if (rpi_len > 0) memmove(rpi_buf, &rpi_buf[1], rpi_len);
     }
 }
 
@@ -916,7 +946,7 @@ static void comm_task(void *pvParameters) {
     while (1) {
         handle_wroom_stream_rx();
         handle_rpi_rx();
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -1051,7 +1081,7 @@ void app_main(void) {
     update_power_relay_only();
     s_sleep_wake_timer = millis();
 
-    ESP_LOGI(TAG, "🚀 ESP32-P4 Non-Zero 39B + Codec2 통화 완전 통합 가동 (Rail: %d)", MY_RAIL_SEQ);
+    ESP_LOGI(TAG, "🚀 ESP32-P4 PLC 통신 최적화 가동 (Rail: %d)", MY_RAIL_SEQ);
 
     xTaskCreatePinnedToCore(comm_task, "comm_task", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(presentation_task, "pres_task", 4096, NULL, 4, NULL, 0);
