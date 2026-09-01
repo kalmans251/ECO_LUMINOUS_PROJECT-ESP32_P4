@@ -19,6 +19,9 @@
 #define TAG "ESP32_P4_MAIN"
 #define MY_RAIL_SEQ          1
 
+// ==========================================
+// 1. 핀 맵 및 통신 설정
+// ==========================================
 #define RPI_UART_NUM         UART_NUM_1
 #define RPI_TX_PIN           48
 #define RPI_RX_PIN           47
@@ -40,13 +43,16 @@
 #define LEDS_PER_ROW         31
 #define NUM_LEDS             (LEDS_PER_ROW * NUM_ROWS)
 
-// I2C INA219
+// I2C INA219 (태양광/배터리 모니터링)
 #define I2C_SDA_PIN          GPIO_NUM_8
 #define I2C_SCL_PIN          GPIO_NUM_9
 #define I2C_FREQ_HZ          400000
 #define INA219_ADDR_LEFT     0x40
 #define INA219_ADDR_RIGHT    0x41
 
+// ==========================================
+// 2. 구조체 및 전역 변수
+// ==========================================
 #pragma pack(push, 1)
 typedef struct {
     uint8_t  header1;
@@ -75,6 +81,10 @@ static led_strip_handle_t s_strip2 = NULL;
 static i2c_master_bus_handle_t s_i2c_bus_handle = NULL;
 static i2c_master_dev_handle_t s_ina_dev_left = NULL;
 static i2c_master_dev_handle_t s_ina_dev_right = NULL;
+static bool s_is_left_ina_ready = false;
+static bool s_is_right_ina_ready = false;
+
+static uint8_t s_master_state[5] = { MY_RAIL_SEQ, 0x0E, 0x01, 0x12, 0x01 };
 
 static volatile uint8_t  s_power_supply_mode = 0;
 static volatile bool     s_is_sleep_mode     = false;
@@ -112,16 +122,14 @@ static float s_smooth_acoustic = 0.0f;
 static float s_peak_bass_max = 2.0f;
 static float s_peak_acoustic_max = 2.0f;
 
-static bool s_is_left_ina_ready = false;
-static bool s_is_right_ina_ready = false;
-
 static uint8_t s_fb1[NUM_LEDS][3] = {0};
 static uint8_t s_fb2[NUM_LEDS][3] = {0};
 
-static inline int64_t millis(void) {
-    return esp_timer_get_time() / 1000;
-}
+static inline int64_t millis(void) { return esp_timer_get_time() / 1000; }
 
+// ==========================================
+// 3. LED 유틸리티 및 효과 함수
+// ==========================================
 static uint8_t sine8(uint8_t theta) {
     float rad = (float)theta * (2.0f * (float)M_PI / 256.0f);
     float val = (sinf(rad) + 1.0f) * 127.5f;
@@ -192,18 +200,26 @@ static void flush_led_strips(void) {
 static void update_led_sequence(void) {
     int64_t current_millis = millis();
     static int64_t last_led_update = 0;
+    static bool blink_state = false;
     bool need_show = false;
 
+// 🚨 비상 통화 모드: 빨간색 비상 점멸 (150ms ON / 150ms OFF)
     if (s_voice_call_mode) {
-        if (current_millis - last_led_update > 30) {
+        if (current_millis - last_led_update > 300) {
             last_led_update = current_millis;
-            uint8_t breathe = sine8(s_anim_frame * 3);
-            uint8_t r_val = (breathe > 60) ? (breathe - 60) : 0;
+            blink_state = !blink_state;
+
+            uint8_t r_val = blink_state ? 255 : 0;
+
             for (int i = 0; i < NUM_LEDS; i++) {
-                s_fb1[i][0] = r_val; s_fb1[i][1] = r_val / 4; s_fb1[i][2] = 0;
-                s_fb2[i][0] = r_val; s_fb2[i][1] = r_val / 4; s_fb2[i][2] = 0;
+                s_fb1[i][0] = 0; // Red (R)
+                s_fb1[i][1] = 0;     // Green (G 제거)
+                s_fb1[i][2] = r_val;     // Blue (B)
+
+                s_fb2[i][0] = 0;
+                s_fb2[i][1] = 0;
+                s_fb2[i][2] = r_val;
             }
-            s_anim_frame++;
             flush_led_strips();
         }
         return;
@@ -525,6 +541,9 @@ static void update_led_sequence(void) {
     if (need_show) flush_led_strips();
 }
 
+// ==========================================
+// 4. I2C INA219 배터리/태양광 센서 함수
+// ==========================================
 static esp_err_t ina219_read_reg(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint16_t *val) {
     if (!dev_handle) return ESP_FAIL;
     uint8_t buf[2];
@@ -573,14 +592,22 @@ static void read_battery_and_calculate_pct(void) {
 }
 
 static void update_power_relay_only(void) {
-    if (s_power_supply_mode == 2) gpio_set_level(RELAY_PIN, 1);
-    else if (s_power_supply_mode == 1) gpio_set_level(RELAY_PIN, 0);
-    else {
-        if (s_latest_bat_pct <= 20) gpio_set_level(RELAY_PIN, 1);
-        else if (s_latest_bat_pct >= 90) gpio_set_level(RELAY_PIN, 0);
+    if (s_power_supply_mode == 2) {
+        gpio_set_level(RELAY_PIN, 1);
+    } else if (s_power_supply_mode == 1) {
+        gpio_set_level(RELAY_PIN, 0);
+    } else {
+        if (s_latest_bat_pct <= 20) {
+            gpio_set_level(RELAY_PIN, 1);
+        } else if (s_latest_bat_pct >= 90) {
+            gpio_set_level(RELAY_PIN, 0);
+        }
     }
 }
 
+// ==========================================
+// 5. UART 송신 헬퍼
+// ==========================================
 static void send_to_wroom(const char *cmd) {
     if (s_wroom_tx_mutex && xSemaphoreTake(s_wroom_tx_mutex, portMAX_DELAY) == pdTRUE) {
         uart_write_bytes(WROOM_CTRL_UART_NUM, cmd, strlen(cmd));
@@ -602,11 +629,16 @@ static void send_bytes_to_rpi(const void *data, size_t len) {
     }
 }
 
+// ==========================================
+// 6. UART 수신 파서 및 FSM
+// ==========================================
 typedef enum {
     RPI_FSM_IDLE,
     RPI_FSM_FIND_A5,
     RPI_FSM_READ_C2_LEN,
     RPI_FSM_READ_C2_DATA,
+    RPI_FSM_FIND_A7,
+    RPI_FSM_READ_MASTER_STATE,
     RPI_FSM_CMD_LSB,
     RPI_FSM_TEXT
 } rpi_fsm_state_t;
@@ -616,6 +648,10 @@ static void handle_rpi_rx(void) {
     static uint8_t s_c2_down_buf[64];
     static int s_c2_down_len = 0;
     static int s_c2_down_idx = 0;
+    
+    static uint8_t s_tmp_state[5];
+    static int s_state_idx = 0;
+    
     static uint8_t s_saved_msb = 0;
     static char s_rpi_txt[64];
     static int s_rpi_txt_idx = 0;
@@ -623,29 +659,64 @@ static void handle_rpi_rx(void) {
     uint8_t temp[128];
     int len = uart_read_bytes(RPI_UART_NUM, temp, sizeof(temp), 0);
 
+    // 💡 [Fast-Path] 오디오 바이너리 중이라도 긴급 통화 명령 즉시 가로채기
+    if (len > 0) {
+        for (int i = 0; i <= len - 9; i++) {
+            if (memcmp(&temp[i], "$CALL_END", 9) == 0) {
+                s_voice_call_mode = false;
+                send_to_wroom("$CALL_END\n");
+                s_rpi_state = RPI_FSM_IDLE;
+                s_rpi_txt_idx = 0;
+                
+                if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                    s_rx_radar_data.emergency_code = 0;
+                    xSemaphoreGive(s_state_mutex);
+                }
+                ESP_LOGW(TAG, "🔴 [긴급 가로채기] 통화 강제 종료 완료");
+            }
+        }
+        for (int i = 0; i <= len - 11; i++) {
+            if (memcmp(&temp[i], "$CALL_START", 11) == 0) {
+                s_voice_call_mode = true;
+                send_to_wroom("$CALL_START\n");
+                s_rpi_state = RPI_FSM_IDLE;
+                s_rpi_txt_idx = 0;
+                
+                if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                    s_rx_radar_data.emergency_code = 1;
+                    xSemaphoreGive(s_state_mutex);
+                }
+                ESP_LOGI(TAG, "📞 [긴급 가로채기] 통화 강제 시작");
+            }
+        }
+    }
+
     for (int i = 0; i < len; i++) {
         uint8_t b = temp[i];
+
+        if (s_rpi_state == RPI_FSM_TEXT && (b == 0x5A || b == 0x7A)) {
+            s_rpi_state = RPI_FSM_IDLE;
+        }
 
         switch (s_rpi_state) {
         case RPI_FSM_IDLE:
             if (b == 0x5A) {
-                s_rpi_state = RPI_FSM_FIND_A5;
+                s_rpi_state = RPI_FSM_FIND_A5; 
+            } else if (b == 0x7A) {
+                s_rpi_state = RPI_FSM_FIND_A7; 
             } else if (b == '$') {
                 s_rpi_txt_idx = 0;
                 s_rpi_txt[s_rpi_txt_idx++] = (char)b;
                 s_rpi_state = RPI_FSM_TEXT;
             } else {
                 s_saved_msb = b;
-                s_rpi_state = RPI_FSM_CMD_LSB;
+                s_rpi_state = RPI_FSM_CMD_LSB; 
             }
             break;
 
         case RPI_FSM_FIND_A5:
-            if (b == 0xA5) {
-                s_rpi_state = RPI_FSM_READ_C2_LEN;
-            } else {
-                s_rpi_state = RPI_FSM_IDLE;
-            }
+            if (b == 0xA5) s_rpi_state = RPI_FSM_READ_C2_LEN; 
+            else s_rpi_state = RPI_FSM_IDLE;
             break;
 
         case RPI_FSM_READ_C2_LEN:
@@ -671,72 +742,25 @@ static void handle_rpi_rx(void) {
             }
             break;
 
-        case RPI_FSM_CMD_LSB: {
-            uint8_t rx_msb = s_saved_msb;
-            uint8_t rx_lsb = b;
-            uint8_t target_rail = rx_msb & 0x0F;
+        case RPI_FSM_FIND_A7:
+            if (b == 0xA7) { 
+                s_rpi_state = RPI_FSM_READ_MASTER_STATE; 
+                s_state_idx = 0; 
+            } else { 
+                s_rpi_state = RPI_FSM_IDLE; 
+            }
+            break;
 
-            if (target_rail == 0 || target_rail == MY_RAIL_SEQ) {
-                if (rx_lsb == 0xDD) {
-                    s_voice_call_mode = true;
-                    if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
-                        s_rx_radar_data.emergency_code = 1;
-                        xSemaphoreGive(s_state_mutex);
-                    }
-                    send_to_wroom("$CALL_START\n");
-                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, 0xDD};
-                    send_bytes_to_rpi(ack, 2);
-                    ESP_LOGI(TAG, "📞 [통화 시작] 수신 완료");
-                }
-                else if (rx_lsb == 0xEE) {
-                    s_voice_call_mode = false;
-                    if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
-                        s_rx_radar_data.emergency_code = 0;
-                        xSemaphoreGive(s_state_mutex);
-                    }
-                    send_to_wroom("$CALL_END\n");
-                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, 0xEE};
-                    send_bytes_to_rpi(ack, 2);
-                    ESP_LOGI(TAG, "🔴 [통화 종료] 수신 완료");
-                }
-                else if (rx_lsb == 0xFF) {
-                    radar_rx_frame_t snap;
-                    if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
-                        snap = s_rx_radar_data;
-                        xSemaphoreGive(s_state_mutex);
-                    }
+        case RPI_FSM_READ_MASTER_STATE:
+            s_tmp_state[s_state_idx++] = b;
+            if (s_state_idx >= 5) {
+                uint8_t target_rail = s_tmp_state[0];
+                if (target_rail == 0 || target_rail == MY_RAIL_SEQ) {
+                    memcpy(s_master_state, s_tmp_state, 5);
 
-                    uint8_t curr_msb = ((s_power_supply_mode & 0x03) << 6) | (MY_RAIL_SEQ & 0x0F);
-                    uint8_t rep_cat  = (s_current_category == 3) ? 2 : s_current_category;
-                    uint8_t rep_sub  = (rep_cat == 2) ? s_music_led_pattern : s_current_sub_mode;
-                    uint8_t curr_lsb = ((s_is_sleep_mode ? 1 : 0) << 7) |
-                                       ((s_is_projector_on ? 1 : 0) << 6) |
-                                       ((rep_cat & 0x03) << 4) | (rep_sub & 0x0F);
-
-                    uint8_t raw[39] = {0};
-                    raw[0] = (uint8_t)MY_RAIL_SEQ;
-                    raw[1] = (uint8_t)((s_latest_l_mw >> 8) & 0xFF); raw[2] = (uint8_t)(s_latest_l_mw & 0xFF);
-                    raw[3] = (uint8_t)((s_latest_r_mw >> 8) & 0xFF); raw[4] = (uint8_t)(s_latest_r_mw & 0xFF);
-                    raw[5] = curr_msb; raw[6] = curr_lsb; raw[7] = s_latest_bat_pct;
-                    raw[8] = (uint8_t)((snap.in_count >> 8) & 0xFF); raw[9] = (uint8_t)(snap.in_count & 0xFF);
-                    raw[10] = (uint8_t)((snap.out_count >> 8) & 0xFF); raw[11] = (uint8_t)(snap.out_count & 0xFF);
-
-                    for (int k = 0; k < 3; k++) {
-                        raw[12 + (k*2)] = (uint8_t)((snap.r1_x[k] >> 8) & 0xFF); raw[13 + (k*2)] = (uint8_t)(snap.r1_x[k] & 0xFF);
-                        raw[18 + (k*2)] = (uint8_t)((snap.r1_y[k] >> 8) & 0xFF); raw[19 + (k*2)] = (uint8_t)(snap.r1_y[k] & 0xFF);
-                        raw[24 + (k*2)] = (uint8_t)((snap.r2_x[k] >> 8) & 0xFF); raw[25 + (k*2)] = (uint8_t)(snap.r2_x[k] & 0xFF);
-                        raw[30 + (k*2)] = (uint8_t)((snap.r2_y[k] >> 8) & 0xFF); raw[31 + (k*2)] = (uint8_t)(snap.r2_y[k] & 0xFF);
-                    }
-                    raw[36] = snap.r1_detected; raw[37] = snap.r2_detected;
-                    raw[38] = s_voice_call_mode ? 1 : 0;
-
-                    uint8_t tf_encoded[39];
-                    for (int j = 0; j < 39; j++) tf_encoded[j] = (uint8_t)((raw[j] + 0x20) & 0xFF);
-                    send_bytes_to_rpi(tf_encoded, 39);
-                }
-                else {
-                    s_power_supply_mode = (rx_msb >> 6) & 0x03;
-                    bool new_sleep = (rx_lsb >> 7) & 0x01;
+                    s_power_supply_mode = (s_master_state[1] >> 6) & 0x03;
+                    bool new_sleep = (s_master_state[1] >> 5) & 0x01;
+                    
                     if (new_sleep != s_is_sleep_mode) {
                         s_is_sleep_mode = new_sleep;
                         if (s_is_sleep_mode) {
@@ -749,59 +773,131 @@ static void handle_rpi_rx(void) {
                         }
                     }
 
-                    s_is_projector_on = (rx_lsb >> 6) & 0x01;
-                    uint8_t new_cat = (rx_lsb >> 4) & 0x03;
-                    uint8_t new_sub = rx_lsb & 0x0F;
-
-                    if (new_cat == 2) {
-                        bool was_not = (s_current_category != 2 && s_current_category != 3);
-                        s_current_category = 2;
-                        if (was_not) { s_anim_frame = 0; clear_all_leds(); }
-
-                        if (new_sub <= 2) {
-                            if (s_music_led_pattern != new_sub || s_current_sub_mode != new_sub) {
-                                s_music_led_pattern = new_sub; s_current_sub_mode = new_sub; s_anim_frame = 0; clear_all_leds();
+                    bool new_call = (s_master_state[1] >> 4) & 0x01;
+                    if (new_call != s_voice_call_mode) {
+                        s_voice_call_mode = new_call;
+                        if (s_voice_call_mode) {
+                            send_to_wroom("$CALL_START\n");
+                            if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                                s_rx_radar_data.emergency_code = 1;
+                                xSemaphoreGive(s_state_mutex);
                             }
-                        } else if (new_sub >= 3 && new_sub <= 12) {
-                            s_current_volume = (new_sub - 2) * 10;
-                            char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,%d,%d\n", s_current_volume, s_play_mode, s_target_track);
-                            send_to_wroom(cmd);
-                        } else if (new_sub == 13) {
-                            s_play_mode = 0;
-                            char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,0,%d\n", s_current_volume, s_target_track);
-                            send_to_wroom(cmd);
-                        } else if (new_sub == 14) {
-                            s_play_mode = 1;
-                            char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,1,%d\n", s_current_volume, s_target_track);
-                            send_to_wroom(cmd);
-                        }
-                    } else if (new_cat == 3) {
-                        bool was_not = (s_current_category != 2 && s_current_category != 3);
-                        s_current_category = 2;
-                        if (was_not) { s_anim_frame = 0; clear_all_leds(); }
-
-                        if (new_sub >= 1 && new_sub <= 15) {
-                            s_target_track = new_sub; s_play_mode = 2;
-                            char cmd[32]; snprintf(cmd, sizeof(cmd), "$CTRL,%d,2,%d\n", s_current_volume, s_target_track);
-                            send_to_wroom(cmd);
-                        }
-                    } 
-                    // [핵심 2] 일반 조명(0, 1)으로 변경 시 노래 끄기 강제 발동
-                    else {
-                        if (s_is_music_on || s_current_category == 2 || s_current_category == 3) { 
-                            send_to_wroom("$MUSIC,OFF\n"); 
-                            s_is_music_on = false; 
-                            ESP_LOGW(TAG, "🎵 음악 모드 해제 -> $MUSIC,OFF 전송");
-                        }
-                        if (new_cat != s_current_category || new_sub != s_current_sub_mode) {
-                            s_current_category = new_cat; s_current_sub_mode = new_sub; s_anim_frame = 0; clear_all_leds();
+                        } else {
+                            send_to_wroom("$CALL_END\n");
+                            if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                                s_rx_radar_data.emergency_code = 0;
+                                xSemaphoreGive(s_state_mutex);
+                            }
                         }
                     }
 
-                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, rx_lsb};
-                    send_bytes_to_rpi(ack, 2);
+                    s_is_projector_on = (s_master_state[1] >> 1) & 0x01;
                     update_power_relay_only();
+
+                    uint8_t new_cat = (s_master_state[2] >> 6) & 0x03;
+                    uint8_t new_sub = s_master_state[2] & 0x3F;
+
+                    uint8_t play_mode = (s_master_state[3] >> 6) & 0x03; 
+                    uint8_t audio_act = (s_master_state[3] >> 4) & 0x03; 
+                    int target_vol    = (s_master_state[3] & 0x0F) * 10;  
+                    int target_track  = s_master_state[4];                
+
+                    if (new_cat == 2) {
+                        s_current_category = 2;
+                        s_music_led_pattern = new_sub;
+                        
+                        char wroom_cmd[64];
+                        if (s_current_volume != target_vol) {
+                            s_current_volume = target_vol;
+                            snprintf(wroom_cmd, sizeof(wroom_cmd), "$VOL,%d\n", s_current_volume);
+                            send_to_wroom(wroom_cmd);
+                        }
+                        
+                        if (s_play_mode != play_mode) {
+                            s_play_mode = play_mode;
+                            snprintf(wroom_cmd, sizeof(wroom_cmd), "$PLAYMODE,%d\n", s_play_mode);
+                            send_to_wroom(wroom_cmd);
+                        }
+
+                        switch(audio_act) {
+                            case 0: 
+                                send_to_wroom("$MUSIC,OFF\n"); 
+                                s_is_music_on = false; 
+                                break;
+                            case 1: 
+                                if (!s_is_music_on) { send_to_wroom("$MUSIC,ON\n"); s_is_music_on = true; }
+                                if (play_mode == 2 && s_target_track != target_track) {
+                                    s_target_track = target_track;
+                                    snprintf(wroom_cmd, sizeof(wroom_cmd), "$TRACK,%d\n", s_target_track);
+                                    send_to_wroom(wroom_cmd);
+                                }
+                                break;
+                            case 2: send_to_wroom("$ACTION,NEXT\n"); break;
+                            case 3: send_to_wroom("$ACTION,PREV\n"); break;
+                        }
+
+                        if (audio_act == 2 || audio_act == 3) {
+                            s_master_state[3] = (s_master_state[3] & 0xCF) | (0x01 << 4);
+                        }
+                    } else {
+                        if (s_is_music_on) {
+                            send_to_wroom("$MUSIC,OFF\n");
+                            s_is_music_on = false;
+                        }
+                        if (new_cat != s_current_category || new_sub != s_current_sub_mode) {
+                            s_current_category = new_cat;
+                            s_current_sub_mode = new_sub;
+                            s_anim_frame = 0;
+                            clear_all_leds();
+                        }
+                    }
+
+                    uint8_t ack[2] = {(uint8_t)MY_RAIL_SEQ, 0xCC};
+                    send_bytes_to_rpi(ack, 2);
                 }
+                s_rpi_state = RPI_FSM_IDLE;
+            }
+            break;
+
+        case RPI_FSM_CMD_LSB: {
+            uint8_t rx_msb = s_saved_msb;
+            uint8_t rx_lsb = b;
+            uint8_t target_rail = rx_msb & 0x0F;
+
+            if ((target_rail == 0 || target_rail == MY_RAIL_SEQ) && rx_lsb == 0xFF) {
+                radar_rx_frame_t snap;
+                if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                    snap = s_rx_radar_data;
+                    xSemaphoreGive(s_state_mutex);
+                }
+
+                uint8_t raw[42] = {0};
+                raw[0] = (uint8_t)MY_RAIL_SEQ;
+                raw[1] = (uint8_t)((s_latest_l_mw >> 8) & 0xFF); raw[2] = (uint8_t)(s_latest_l_mw & 0xFF);
+                raw[3] = (uint8_t)((s_latest_r_mw >> 8) & 0xFF); raw[4] = (uint8_t)(s_latest_r_mw & 0xFF);
+                
+                memcpy(&raw[5], s_master_state, 5); 
+
+                raw[10] = s_latest_bat_pct;
+                raw[11] = (uint8_t)((snap.in_count >> 8) & 0xFF); raw[12] = (uint8_t)(snap.in_count & 0xFF);
+                raw[13] = (uint8_t)((snap.out_count >> 8) & 0xFF); raw[14] = (uint8_t)(snap.out_count & 0xFF);
+
+                for (int k = 0; k < 3; k++) {
+                    raw[15 + (k*2)] = (uint8_t)((snap.r1_x[k] >> 8) & 0xFF); raw[16 + (k*2)] = (uint8_t)(snap.r1_x[k] & 0xFF);
+                    raw[21 + (k*2)] = (uint8_t)((snap.r1_y[k] >> 8) & 0xFF); raw[22 + (k*2)] = (uint8_t)(snap.r1_y[k] & 0xFF);
+                    raw[27 + (k*2)] = (uint8_t)((snap.r2_x[k] >> 8) & 0xFF); raw[28 + (k*2)] = (uint8_t)(snap.r2_x[k] & 0xFF);
+                    raw[33 + (k*2)] = (uint8_t)((snap.r2_y[k] >> 8) & 0xFF); raw[34 + (k*2)] = (uint8_t)(snap.r2_y[k] & 0xFF);
+                }
+                raw[39] = snap.r1_detected; 
+                raw[40] = snap.r2_detected;
+                
+                uint8_t em_code = snap.emergency_code;
+                if (s_voice_call_mode && em_code == 0) em_code = 1; 
+                raw[41] = em_code;
+
+                uint8_t tf_encoded[42];
+                for (int j = 0; j < 42; j++) tf_encoded[j] = (uint8_t)((raw[j] + 0x20) & 0xFF);
+                send_bytes_to_rpi(tf_encoded, 42);
             }
             s_rpi_state = RPI_FSM_IDLE;
             break;
@@ -813,11 +909,20 @@ static void handle_rpi_rx(void) {
                     s_rpi_txt[s_rpi_txt_idx] = '\0';
                     if (strstr(s_rpi_txt, "$CALL_END") != NULL) {
                         s_voice_call_mode = false;
+                        s_master_state[1] &= ~(1 << 4); 
                         if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
                             s_rx_radar_data.emergency_code = 0;
                             xSemaphoreGive(s_state_mutex);
                         }
                         send_to_wroom("$CALL_END\n");
+                    } else if (strstr(s_rpi_txt, "$CALL_START") != NULL) {
+                        s_voice_call_mode = true;
+                        s_master_state[1] |= (1 << 4); 
+                        if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
+                            s_rx_radar_data.emergency_code = 1;
+                            xSemaphoreGive(s_state_mutex);
+                        }
+                        send_to_wroom("$CALL_START\n");
                     }
                 }
                 s_rpi_state = RPI_FSM_IDLE;
@@ -832,7 +937,15 @@ static void handle_rpi_rx(void) {
     }
 }
 
-typedef enum { FSM_IDLE, FSM_FIND_55, FSM_READ_BODY, FSM_FIND_5A, FSM_READ_VOICE_LEN, FSM_READ_VOICE_BODY, FSM_READ_TEXT } unified_fsm_t;
+typedef enum { 
+    FSM_IDLE, 
+    FSM_FIND_55, 
+    FSM_READ_BODY, 
+    FSM_FIND_5A, 
+    FSM_READ_VOICE_LEN, 
+    FSM_READ_VOICE_BODY, 
+    FSM_READ_TEXT 
+} unified_fsm_t;
 
 static void handle_wroom_stream_rx(void) {
     static unified_fsm_t s_fsm_state = FSM_IDLE;
@@ -931,6 +1044,7 @@ static void handle_wroom_stream_rx(void) {
                         s_txt_buf[s_txt_idx] = '\0';
                         if (strstr(s_txt_buf, "$CALL_START") != NULL) {
                             s_voice_call_mode = true;
+                            s_master_state[1] |= (1 << 4); 
                             if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
                                 s_rx_radar_data.emergency_code = 1;
                                 xSemaphoreGive(s_state_mutex);
@@ -938,6 +1052,7 @@ static void handle_wroom_stream_rx(void) {
                             send_bytes_to_rpi("$CALL_START\n", 12);
                         } else if (strstr(s_txt_buf, "$CALL_END") != NULL) {
                             s_voice_call_mode = false;
+                            s_master_state[1] &= ~(1 << 4); 
                             if (xSemaphoreTake(s_state_mutex, 0) == pdTRUE) {
                                 s_rx_radar_data.emergency_code = 0;
                                 xSemaphoreGive(s_state_mutex);
@@ -966,7 +1081,7 @@ static void comm_task(void *pvParameters) {
     while (1) {
         handle_wroom_stream_rx();
         handle_rpi_rx();
-        vTaskDelay(1);
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -1016,6 +1131,9 @@ static void presentation_task(void *pvParameters) {
     }
 }
 
+// ==========================================
+// 7. 하드웨어 초기화
+// ==========================================
 static void init_power_relays(void) {
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << RELAY_PIN) | (1ULL << PROJECTOR_PIN),
@@ -1082,6 +1200,9 @@ static void init_led_strips(void) {
     flush_led_strips();
 }
 
+// ==========================================
+// 8. 메인 진입점
+// ==========================================
 void app_main(void) {
     s_state_mutex = xSemaphoreCreateMutex();
     s_wroom_tx_mutex = xSemaphoreCreateMutex();
@@ -1101,7 +1222,7 @@ void app_main(void) {
     update_power_relay_only();
     s_sleep_wake_timer = millis();
 
-    ESP_LOGI(TAG, "🚀 ESP32-P4 PLC 통신 최적화 가동 (Rail: %d)", MY_RAIL_SEQ);
+    ESP_LOGI(TAG, "🚀 ESP32-P4 가동 (5-Byte Master State 동기화) (Rail: %d)", MY_RAIL_SEQ);
 
     xTaskCreatePinnedToCore(comm_task, "comm_task", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(presentation_task, "pres_task", 4096, NULL, 4, NULL, 0);
